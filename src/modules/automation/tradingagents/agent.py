@@ -107,6 +107,38 @@ class TradingAgentsAgent(BaseAgent):
 
         md = get_market_data()
         sym, mkt = stock.symbol, stock.market.value
+
+        if mkt == "CRYPTO":
+            # 加密货币:quote/kline 走 marketdata 包(OKX vendor);资金流/事件/财报不适用
+            data: dict = {}
+            try:
+                quotes, klines_list = await asyncio.gather(
+                    asyncio.to_thread(md.quotes, [sym], market=mkt),
+                    asyncio.to_thread(md.klines, sym, market=mkt, days=120),
+                )
+            except Exception as e:
+                logger.warning(f"[TA] 加密数据收集部分失败: {e}")
+                quotes, klines_list = [], []
+            quote_dict = _quote_to_row(quotes[0]) if quotes else {}
+            technical = None
+            try:
+                from src.platform.marketdata.collectors.kline_collector import KlineCollector
+                technical = await asyncio.to_thread(
+                    KlineCollector(stock.market).get_technical_indicators, stock.symbol
+                )
+            except Exception as e:
+                logger.debug(f"[TA] 技术指标预算失败,LLM 仍可从 K线 CSV 自行计算: {e}")
+            return {
+                "stock": stock,
+                "quote": quote_dict,
+                "klines": klines_list,
+                "capital_flow": [],
+                "events": [],
+                "financial": None,
+                "technical": technical,
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+            }
+
         try:
             quotes, klines_list, cf, events_list = await asyncio.gather(
                 asyncio.to_thread(md.quotes, [sym], market=mkt),

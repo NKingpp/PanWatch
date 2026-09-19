@@ -403,6 +403,14 @@ def search_stocks(query: str, market: str = "", limit: int = 20) -> list[dict]:
     if not q:
         return []
 
+    # 加密货币(OKX):代码含 '-'(如 BTC-USDT)或筛选 market=CRYPTO 时走 OKX 搜索
+    if market == "CRYPTO" or _looks_like_instid(q):
+        crypto = _search_crypto(q if q else "", market, limit)
+        if crypto:
+            return crypto[:limit]
+        if market == "CRYPTO":
+            return []
+
     # 尝试实时搜索
     results = _realtime_search(q, market, limit)
     if len(results) >= limit:
@@ -425,6 +433,73 @@ def search_stocks(query: str, market: str = "", limit: int = 20) -> list[dict]:
         if len(results) >= limit:
             break
     return results
+
+
+# OKX instId 形态: BTC-USDT / BTC-USDT-SWAP / BTC-USD-260920-66000-C
+_INSTID_RE = None  # lazy import re
+
+
+def _looks_like_instid(q: str) -> bool:
+    """全大写、含 '-':像 OKX instId(BTC-USDT),不像 A股/港股/美股代码。"""
+    import re
+    global _INSTID_RE
+    if _INSTID_RE is None:
+        _INSTID_RE = re.compile(r"^[A-Z0-9]+(-[A-Z0-9]+)+$")
+    return bool(_INSTID_RE.match(q))
+
+
+# 进程内缓存 OKX 品种列表(拉全量一次,后续本地匹配)
+_CRYPTO_CACHE: list[dict] = []
+_CRYPTO_CACHE_TS: float = 0.0
+_CRYPTO_CACHE_TTL = 3600  # 1h
+
+
+def _search_crypto(query: str, market: str, limit: int) -> list[dict]:
+    """OKX 品种搜索:精确 instId > 前缀匹配。失败返回 [](不阻塞股票搜索)。"""
+    global _CRYPTO_CACHE, _CRYPTO_CACHE_TS
+
+    if market and market != "CRYPTO":
+        return []
+
+    import time as _time
+    now = _time.time()
+    if not _CRYPTO_CACHE or now - _CRYPTO_CACHE_TS > _CRYPTO_CACHE_TTL:
+        try:
+            from marketdata.vendors.okx import fetch_instruments
+            insts = []
+            for inst_type in ("SPOT", "SWAP"):
+                insts.extend(fetch_instruments(inst_type))
+            _CRYPTO_CACHE = [
+                {"symbol": i.inst_id, "name": _crypto_name(i), "market": "CRYPTO"}
+                for i in insts
+            ]
+            _CRYPTO_CACHE_TS = now
+        except Exception as e:
+            logger.warning(f"OKX 品种列表获取失败: {e}")
+            return []
+
+    q = (query or "").strip().upper()
+    if not q:
+        # 空查询(仅点了"加密"筛选):返回主流币种头部
+        return _CRYPTO_CACHE[:limit]
+
+    exact = [r for r in _CRYPTO_CACHE if r["symbol"] == q]
+    prefix = [r for r in _CRYPTO_CACHE if r["symbol"].startswith(q) and r["symbol"] != q]
+    # 主流计价货币优先(USDT > USDC/USD),再按长度升序
+    def _rank(r: dict) -> tuple:
+        s = r["symbol"]
+        return (0 if s.endswith("-USDT") else 1 if s.endswith(("-USDC", "-USD")) else 2, len(s), s)
+    prefix.sort(key=_rank)
+    return (exact + prefix)[:limit]
+
+
+def _crypto_name(inst) -> str:
+    """OKXInstrument → 展示名:BTC-USDT-SWAP → BTC-USDT 永续;期权 → 家族+行权价+方向。"""
+    iid = inst.inst_id
+    if inst.inst_type == "SWAP":
+        base = iid.rsplit("-SWAP", 1)[0]
+        return f"{base} 永续"
+    return iid
 
 
 def _cached_search(query: str, market: str = "", limit: int = 20) -> list[dict]:

@@ -242,6 +242,82 @@ class NewsArticle:
 
 
 @dataclass
+class OKXTicker:
+    """OKX V5 行情快照(ticker/tickers 接口)。现货/合约/期权统一,拿不到的字段为 None。
+
+    vol24h: 成交量(币,合约为张); volCcy24h: 成交量(计价货币)。
+    """
+
+    inst_id: str
+    inst_type: str                  # SPOT / SWAP / FUTURES / OPTION
+    last: float | None = None       # 最新成交价
+    last_sz: float | None = None    # 最新成交的数量
+    ask_px: float | None = None     # 卖一价
+    ask_sz: float | None = None
+    bid_px: float | None = None     # 买一价
+    bid_sz: float | None = None
+    open24h: float | None = None    # 24h 开盘价
+    high24h: float | None = None
+    low24h: float | None = None
+    vol24h: float | None = None
+    vol_ccy24h: float | None = None
+    sod_utc0: float | None = None   # UTC 0 点开盘价
+    sod_utc8: float | None = None   # UTC+8 0 点开盘价
+    ts: datetime | None = None      # 行情时间
+
+    @property
+    def change_pct_24h(self) -> float | None:
+        """24h 涨跌幅(%)。以 open24h 为基。任一缺失返回 None。"""
+        if self.open24h and self.last is not None and self.open24h != 0:
+            return (self.last - self.open24h) / self.open24h * 100
+        return None
+
+
+@dataclass
+class OKXOrderBook:
+    """OKX V5 盘口(books 接口快照)。asks/bids: [(价格, 数量, 委托数), ...] 按深度排序。"""
+
+    inst_id: str
+    asks: list[tuple[float, float, int]] = field(default_factory=list)
+    bids: list[tuple[float, float, int]] = field(default_factory=list)
+    ts: datetime | None = None
+    seq_id: int | None = None       # 快照序列号(增量合并用)
+
+
+@dataclass
+class OKXTrade:
+    """OKX V5 最新成交(trades 接口)。"""
+
+    inst_id: str
+    trade_id: str = ""
+    px: float | None = None
+    sz: float | None = None
+    side: str = ""                  # buy / sell
+    ts: datetime | None = None
+
+
+@dataclass
+class OKXInstrument:
+    """OKX V5 交易品种(public/instruments)。合约/期权字段现货为空。"""
+
+    inst_id: str
+    inst_type: str                  # SPOT / SWAP / FUTURES / OPTION
+    inst_family: str = ""           # 交易品种家族(如 BTC-USD)
+    base_ccy: str = ""              # 现货: 基础货币
+    quote_ccy: str = ""             # 现货: 计价货币
+    settle_ccy: str = ""            # 合约: 保证金币种
+    ct_val: float | None = None     # 合约: 合约面值
+    ct_val_ccy: str = ""            # 合约: 面值货币
+    ct_type: str = ""               # 正向/反向
+    lever: str = ""
+    list_time: datetime | None = None
+    exp_time: datetime | None = None  # 期权/交割合约: 到期时间
+    option_type: str = ""           # 期权: C/P
+    strike: float | None = None     # 期权: 行权价
+    uly: str = ""
+
+
+@dataclass
 class Response:
     """Engine 返回:承载 payload + 命中的 vendor/延迟。"""
 

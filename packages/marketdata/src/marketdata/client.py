@@ -370,6 +370,62 @@ class MarketData:
         resp = self._northbound_engine.fetch(req)
         return resp.data or []
 
+    # ---------------- OKX 交易所行情(现货/永续/交割/期权) ----------------
+
+    def crypto_quotes(self, inst_ids: list[str], *, proxy: str = "") -> list[Quote]:
+        """OKX 实时报价(逐品种,含最新价/买一卖一/24h 统计)。inst_id 如 BTC-USDT。"""
+        from marketdata.vendors.okx import fetch_ticker, _ticker_to_quote
+
+        out: list[Quote] = []
+        for inst_id in inst_ids:
+            try:
+                out.append(_ticker_to_quote(fetch_ticker(inst_id, proxy=proxy)))
+            except Exception as e:
+                logger.warning(f"OKX quote {inst_id} 失败: {e}")
+        return out
+
+    def crypto_klines(self, inst_id: str, *, bar: str = "day", limit: int = 120, proxy: str = "") -> list:
+        """OKX K 线(单品种,升序 list[Bar])。bar 可用 day/1h/4h/15m 等。"""
+        from marketdata.vendors.okx import fetch_candles
+
+        try:
+            return fetch_candles(inst_id, bar=bar, limit=limit, proxy=proxy)
+        except Exception as e:
+            logger.warning(f"OKX kline {inst_id} 失败: {e}")
+            return []
+
+    def crypto_tickers(self, inst_type: str = "SPOT", *, proxy: str = "") -> list:
+        """OKX 全量行情快照,按品类筛选。inst_type: SPOT/SWAP/FUTURES/OPTION。"""
+        from marketdata.vendors.okx import fetch_tickers
+
+        try:
+            return fetch_tickers(inst_type, proxy=proxy)
+        except Exception as e:
+            logger.warning(f"OKX tickers {inst_type} 失败: {e}")
+            return []
+
+    def crypto_order_book(self, inst_id: str, size: int = 20, *, proxy: str = ""):
+        """OKX 盘口快照。"""
+        from marketdata.vendors.okx import fetch_order_book
+
+        return fetch_order_book(inst_id, size, proxy=proxy)
+
+    def crypto_trades(self, inst_id: str, limit: int = 100, *, proxy: str = "") -> list:
+        """OKX 最新成交。"""
+        from marketdata.vendors.okx import fetch_trades
+
+        return fetch_trades(inst_id, limit, proxy=proxy)
+
+    def crypto_instruments(self, inst_type: str = "SPOT", *, inst_family: str = "", proxy: str = "") -> list:
+        """OKX 交易品种列表(按品类/家族筛选)。"""
+        from marketdata.vendors.okx import fetch_instruments
+
+        try:
+            return fetch_instruments(inst_type, inst_family=inst_family, proxy=proxy)
+        except Exception as e:
+            logger.warning(f"OKX instruments {inst_type} 失败: {e}")
+            return []
+
     def health(self) -> dict[str, dict]:
         """每个 vendor 的内存健康度快照(成功率 / p50 延迟 / 最近错误)。"""
         return self.metrics.snapshot()

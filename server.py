@@ -500,6 +500,34 @@ DATA_SOURCE_SEEDS: list[dict] = [
             "supports_batch": True,
             "test_symbols": ["AAPL"],
         },
+        # OKX 交易所行情(CRYPTO 市场专用:现货/永续/交割/期权,免鉴权公共行情)
+        {
+            "name": "OKX 行情",
+            "type": "quote",
+            "provider": "okx",
+            "config": {
+                "description": "OKX V5 公共行情(免鉴权)。仅 CRYPTO 市场;symbol 用 instId"
+                "(如 BTC-USDT / BTC-USDT-SWAP / BTC-USD-260920-66000-C)。",
+                "proxy": "",
+            },
+            "enabled": True,
+            "priority": 0,
+            "supports_batch": False,  # 逐品种 /market/ticker
+            "test_symbols": ["BTC-USDT"],
+        },
+        {
+            "name": "OKX K线",
+            "type": "kline",
+            "provider": "okx",
+            "config": {
+                "description": "OKX V5 K线(免鉴权)。仅 CRYPTO 市场;config.bar 可设 1m/15m/1h/4h/day 等。",
+                "bar": "",
+            },
+            "enabled": True,
+            "priority": 0,
+            "supports_batch": False,
+            "test_symbols": ["BTC-USDT"],
+        },
         # 事件日历数据源（基于公告结构化）
         {
             "name": "东方财富事件日历",

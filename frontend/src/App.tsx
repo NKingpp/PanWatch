@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Routes, Route, NavLink, useLocation, Navigate } from 'react-router-dom'
-import { TrendingUp, Bot, ScrollText, Settings, List, Database, Clock, LayoutDashboard, Github, BellRing, Sparkles, Activity, ClipboardCheck, MessageCircle } from 'lucide-react'
+import { TrendingUp, Bot, ScrollText, Settings, List, Database, Clock, LayoutDashboard, Github, BellRing, Sparkles, Activity, ClipboardCheck, MessageCircle, Zap } from 'lucide-react'
 import { useTheme } from '@/hooks/use-theme'
 import { appApi, fetchAPI, isAuthenticated } from '@panwatch/api'
 import DashboardPage from '@/pages/Dashboard'
@@ -13,6 +13,7 @@ import HistoryPage from '@/pages/History'
 import AnalysisDetailPage from '@/pages/AnalysisDetail'
 import PriceAlertsPage from '@/pages/PriceAlerts'
 import PaperTradingPage from '@/pages/PaperTrading'
+import OKXAgentPage from '@/pages/OKXAgent'
 import EvaluationsPage from '@/pages/Evaluations'
 import AssistantPage from '@/pages/Assistant'
 import LoginPage from '@/pages/Login'
@@ -32,6 +33,7 @@ const navItems = [
   { to: '/assistant', icon: MessageCircle, label: '助手' },
   { to: '/alerts', icon: BellRing, label: '提醒' },
   { to: '/agents', icon: Bot, label: 'Agent' },
+  { to: '/okx-agent', icon: Zap, label: 'OKX交易' },
   { to: '/evaluations', icon: ClipboardCheck, label: '验证中心' },
   { to: '/history', icon: Clock, label: '历史' },
   { to: '/datasources', icon: Database, label: '数据源' },
@@ -271,6 +273,7 @@ function App() {
           <Route path="/opportunities" element={<OpportunitiesPage />} />
           <Route path="/portfolio" element={<StocksPage />} />
           <Route path="/agents" element={<AgentsPage />} />
+          <Route path="/okx-agent" element={<OKXAgentPage />} />
           <Route path="/evaluations" element={<EvaluationsPage />} />
           <Route path="/history" element={<HistoryPage />} />
           <Route path="/paper-trading" element={<PaperTradingPage />} />

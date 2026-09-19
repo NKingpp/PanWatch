@@ -97,13 +97,20 @@ def is_hk_share(symbol: str) -> bool:
     return bool(symbol) and len(symbol) == 5 and symbol.isdigit()
 
 
+def is_crypto(symbol: str) -> bool:
+    """加密货币 instId 判定:形如 BTC-USDT / ETH-USDT-SWAP(字母数字-字母数字)。"""
+    import re
+    return bool(re.fullmatch(r"[A-Z0-9]+(-[A-Z0-9]+)+", str(symbol or "").upper()))
+
+
 def is_panwatch_routable(symbol: str) -> bool:
     """该 ticker 是否应该走 PanWatch 数据(而不是上游 yfinance)。
 
     A 股(6 位数字)yfinance 拉不到,港股(5 位数字)yfinance 也要 .HK 后缀,
-    都需要 PanWatch 兜底。美股(字母 ticker)继续走 yfinance。
+    加密(BTC-USDT 等 instId)yfinance 无此标的 —— 都需要 PanWatch 兜底。
+    美股(字母 ticker)继续走 yfinance。
     """
-    return is_a_share(symbol) or is_hk_share(symbol)
+    return is_a_share(symbol) or is_hk_share(symbol) or is_crypto(symbol)
 
 
 def _looks_like_cn_keyword(symbol: str) -> bool:
@@ -205,8 +212,8 @@ def _patched_route_to_vendor(method_name: str, *args, **kwargs):
         if is_panwatch_routable(cached_symbol):
             symbol = cached_symbol
 
-    # A 股:yfinance/finnhub 拉不到,直接走 PanWatch
-    if is_a_share(symbol) and _cache():
+    # A 股 / 加密:yfinance/finnhub 拉不到,直接走 PanWatch
+    if (is_a_share(symbol) or is_crypto(symbol)) and _cache():
         try:
             result = _serve_from_panwatch(method_name, symbol, kwargs, args=args)
             _emit_toolkit_log(
@@ -415,6 +422,8 @@ def _market_for_symbol(symbol: str):
         return MarketCode.CN
     if is_hk_share(symbol):
         return MarketCode.HK
+    if is_crypto(symbol):
+        return MarketCode.CRYPTO
     return MarketCode.US
 
 
@@ -647,7 +656,7 @@ def _stock_meta_header(symbol: str) -> str:
     if isinstance(quote, dict):
         industry = quote.get("industry") or ""
 
-    market_label = {"CN": "中国 A 股", "HK": "港股", "US": "美股"}.get(market, market)
+    market_label = {"CN": "中国 A 股", "HK": "港股", "US": "美股", "CRYPTO": "加密货币(OKX)"}.get(market, market)
     cur_price = _attr(quote, "current_price", "") or _attr(quote, "price", "")
     change_pct = _attr(quote, "change_pct", "")
 

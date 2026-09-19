@@ -133,6 +133,10 @@ def is_trading_day(market, d: date | datetime | None = None) -> bool:
     code = _to_market_code(market)
     target = _resolve_date(code, d)
 
+    # 加密货币 7×24,永远开市
+    if code == MarketCode.CRYPTO:
+        return True
+
     # 周末:三个市场都不开。零依赖、永远准确,放在最前面。
     if target.weekday() >= 5:
         return False

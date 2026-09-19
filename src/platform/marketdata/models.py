@@ -8,6 +8,7 @@ class MarketCode(str, Enum):
     CN = "CN"  # A股
     HK = "HK"  # 港股
     US = "US"  # 美股
+    CRYPTO = "CRYPTO"  # 加密货币(OKX 等交易所,symbol 用 instId 如 BTC-USDT)
 
 
 @dataclass
@@ -80,6 +81,15 @@ MARKETS: dict[MarketCode, MarketDef] = {
             TradingSession(time(9, 30), time(16, 0)),
         ],
         symbol_pattern=r"^[A-Z]{1,5}$",
+    ),
+    MarketCode.CRYPTO: MarketDef(
+        code=MarketCode.CRYPTO,
+        name="加密货币",
+        timezone="UTC",
+        # 7×24 连续交易:全天一个时段
+        sessions=[TradingSession(time(0, 0), time(23, 59, 59))],
+        # instId 如 BTC-USDT / BTC-USDT-SWAP / BTC-USD-260920-66000-C
+        symbol_pattern=r"^[A-Z0-9-]+$",
     ),
 }
 

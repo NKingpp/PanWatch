@@ -34,6 +34,7 @@ from src.modules.market.api import (
     quotes,
     stocks,
 )
+from src.modules.okx_agent import api as okx_agent_api
 from src.modules.paper_trading.api import paper_trading
 from src.modules.portfolio.api import accounts, dashboard, history
 from src.modules.research.api import (
@@ -193,6 +194,13 @@ app.include_router(
     assistant_api.router,
     prefix="/api/assistant",
     tags=["assistant"],
+    dependencies=protected,
+)
+# OKX Agent 自动交易(自带开关检查;读写分离,读接口开关关了也能查状态)
+app.include_router(
+    okx_agent_api.router,
+    prefix="/api/okx-agent",
+    tags=["okx-agent"],
     dependencies=protected,
 )
 

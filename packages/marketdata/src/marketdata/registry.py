@@ -38,6 +38,7 @@ from marketdata.vendors.news import (
     XueqiuNewsVendor,
 )
 from marketdata.vendors.northbound import HexinNorthboundVendor
+from marketdata.vendors.okx import OKXKlineVendor, OKXQuoteVendor
 from marketdata.vendors.sina import SinaQuoteVendor
 from marketdata.vendors.tencent import TencentQuoteVendor
 from marketdata.vendors.yfinance import YFinanceQuoteVendor
@@ -50,12 +51,14 @@ VENDOR_CLASSES_BY_TYPE: dict[str, dict[str, type]] = {
         "sina": SinaQuoteVendor,
         "eastmoney": EastmoneyQuoteVendor,
         "yfinance": YFinanceQuoteVendor,
+        "okx": OKXQuoteVendor,
     },
     "kline": {
         "tencent": TencentKlineVendor,
         "stooq": StooqKlineVendor,
         "eastmoney": EastmoneyKlineVendor,
         "yahoo": YahooKlineVendor,
+        "okx": OKXKlineVendor,
     },
     "capital_flow": {
         "eastmoney": EastmoneyCapitalFlowVendor,

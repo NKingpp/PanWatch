@@ -1965,6 +1965,87 @@ def _m126_assistant_task_events(conn: Connection) -> None:
     )
 
 
+def _m127_okx_agent_tables(conn: Connection) -> None:
+    """OKX Agent 自动交易:订单执行记录表(密钥不落库,从 env 读)。"""
+    if not _has_table(conn, "okx_agent_orders"):
+        conn.execute(
+            text(
+                """
+CREATE TABLE okx_agent_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL DEFAULT 0,
+    inst_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    ord_type TEXT NOT NULL DEFAULT 'market',
+    td_mode TEXT NOT NULL DEFAULT 'cash',
+    sz TEXT NOT NULL DEFAULT '',
+    px TEXT NOT NULL DEFAULT '',
+    cl_ord_id TEXT NOT NULL DEFAULT '',
+    ord_id TEXT,
+    status TEXT NOT NULL DEFAULT 'submitted',
+    error_code TEXT NOT NULL DEFAULT '',
+    error_msg TEXT NOT NULL DEFAULT '',
+    okx_response TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+            )
+        )
+    _create_index_if_missing(
+        conn,
+        "ix_okx_agent_orders_cl_ord_id",
+        "CREATE INDEX ix_okx_agent_orders_cl_ord_id ON okx_agent_orders(cl_ord_id)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_okx_agent_orders_status",
+        "CREATE INDEX ix_okx_agent_orders_status ON okx_agent_orders(status)",
+    )
+
+
+def _m128_ta_trade_strategies(conn: Connection) -> None:
+    """TradingAgents AI 策略表:多 Agent 决策结果 → 待确认交易策略 → 人工审批后执行。"""
+    if not _has_table(conn, "ta_trade_strategies"):
+        conn.execute(
+            text(
+                """
+CREATE TABLE ta_trade_strategies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inst_id TEXT NOT NULL,
+    action TEXT NOT NULL DEFAULT 'hold',
+    action_label TEXT NOT NULL DEFAULT '',
+    rating_raw TEXT NOT NULL DEFAULT '',
+    confidence REAL DEFAULT 0,
+    ord_type TEXT NOT NULL DEFAULT 'market',
+    td_mode TEXT NOT NULL DEFAULT 'cash',
+    sz TEXT NOT NULL DEFAULT '',
+    px TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    trace_id TEXT NOT NULL DEFAULT '',
+    analysis_date TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    ord_id TEXT,
+    okx_response TEXT,
+    error_msg TEXT NOT NULL DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+            )
+        )
+    _create_index_if_missing(
+        conn,
+        "ix_ta_trade_strategies_status",
+        "CREATE INDEX ix_ta_trade_strategies_status ON ta_trade_strategies(status)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_ta_trade_strategies_inst_id",
+        "CREATE INDEX ix_ta_trade_strategies_inst_id ON ta_trade_strategies(inst_id)",
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -1992,6 +2073,8 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(124, "assistant_context_snapshots", _m124_assistant_context_snapshots),
     Migration(125, "assistant_task_protocol", _m125_assistant_task_protocol),
     Migration(126, "assistant_task_events", _m126_assistant_task_events),
+    Migration(127, "okx_agent_tables", _m127_okx_agent_tables),
+    Migration(128, "ta_trade_strategies", _m128_ta_trade_strategies),
 )
 
 

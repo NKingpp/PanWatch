@@ -11,6 +11,7 @@ class Market(str, Enum):
     CN = "CN"
     HK = "HK"
     US = "US"
+    CRYPTO = "CRYPTO"  # 加密货币(OKX 等);symbol 直接用交易所 instId(如 BTC-USDT)
 
 
 _CN_RE = re.compile(r"^[036]\d{5}$")   # 6 位,0/3/6 开头
@@ -18,8 +19,14 @@ _HK_RE = re.compile(r"^\d{5}$")        # 5 位数字
 _US_RE = re.compile(r"^[A-Z.]{1,6}$")  # 1-6 位字母(含指数 .DJI)
 
 
+# OKX instId 形态: BTC-USDT / BTC-USDT-SWAP / BTC-USD-260920-66000-C(≥2 段,含 '-')
+_INSTID_RE = re.compile(r"^[A-Z0-9]+(-[A-Z0-9]+)+$")
+
+
 def _detect_market(code: str) -> Market:
     c = code.strip().upper()
+    if _INSTID_RE.match(c):
+        return Market.CRYPTO
     if _CN_RE.match(c):
         return Market.CN
     if _HK_RE.match(c):

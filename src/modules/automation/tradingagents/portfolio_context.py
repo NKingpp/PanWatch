@@ -42,7 +42,7 @@ def build_stock_metadata_context(
     if not stock_symbol:
         return ""
 
-    market_label = {"CN": "中国 A 股", "HK": "港股", "US": "美股"}.get(market, market)
+    market_label = {"CN": "中国 A 股", "HK": "港股", "US": "美股", "CRYPTO": "加密货币(OKX)"}.get(market, market)
     lines = [
         "[Stock Metadata]",
         f"- Ticker: {stock_symbol}",
