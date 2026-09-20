@@ -55,11 +55,14 @@ def build_ta_llm_config(
 
     # 继承上游默认 config(含 data_cache_dir / project_dir / memory_log_path 等),
     # 否则 TradingAgentsGraph.__init__ 用 os.makedirs(config["data_cache_dir"]) 会 KeyError。
+    # 0.4.x: dict DEFAULT_CONFIG; 0.5.x: pydantic TradingAgentsConfig(必填字段见下)。
+    config: dict[str, Any] = {}
     try:
-        from tradingagents.default_config import DEFAULT_CONFIG as _UPSTREAM_DEFAULT
+        from tradingagents.default_config import DEFAULT_CONFIG as _UPSTREAM_DEFAULT  # 0.4.x
         config = dict(_UPSTREAM_DEFAULT)
+        _is_new_config = False
     except ImportError:
-        config = {}
+        _is_new_config = True
 
     # PanWatch 覆盖。
     # ⚠️ llm_provider 故意不用 "openai":TA 检测到 openai 会强制开 use_responses_api=True
@@ -72,6 +75,24 @@ def build_ta_llm_config(
     # - quick_model 未指定 → 用 deep_model(单模型场景退化)
     deep_llm = (deep_model or ai_client.model or "").strip() or ai_client.model
     quick_llm = (quick_model or deep_llm or "").strip() or deep_llm
+
+    if _is_new_config:
+        # 0.5.x: TradingAgentsConfig(pydantic)。无 backend_url 字段 — base_url 走
+        # OPENROUTER_API_BASE 环境变量(inject_api_key_env 注入)。
+        # response_language 是 BCP-47 tag;0.4.x 的 "Chinese" 不再合法。
+        lang = output_language.strip().lower()
+        response_language = "zh-CN" if lang.startswith("zh") or lang.startswith("chin") else "en-US"
+        from tradingagents.config import TradingAgentsConfig
+        return TradingAgentsConfig(  # type: ignore[return-value]
+            llm_provider="openrouter",
+            deep_think_llm=deep_llm,
+            quick_think_llm=quick_llm,
+            reasoning_effort="medium",
+            response_language=response_language,
+            max_debate_rounds=max(1, int(debate_rounds)),
+            max_risk_discuss_rounds=1,
+            max_recur_limit=100,
+        )
 
     config.update({
         "llm_provider": "openrouter",
@@ -106,3 +127,7 @@ def inject_api_key_env(ai_client: AIClient) -> None:
     os.environ["OPENROUTER_API_KEY"] = ai_client.api_key
     os.environ["OPENAI_API_KEY"] = ai_client.api_key
     os.environ["DEEPSEEK_API_KEY"] = ai_client.api_key
+    # 0.5.x 无 config.backend_url 字段;ChatOpenRouter 读 OPENROUTER_API_BASE
+    base_url = getattr(ai_client, "base_url", "")
+    if base_url and isinstance(base_url, str):
+        os.environ["OPENROUTER_API_BASE"] = base_url

@@ -481,20 +481,31 @@ class TradingAgentsAgent(BaseAgent):
         # patch + 数据上下文,确保 TradingAgents 调 route_to_vendor 时拿到 PanWatch 数据
         trace_id_for_ctx = getattr(progress_handler, "trace_id", "") if progress_handler else ""
         with patch_route_to_vendor(), panwatch_data_context(panwatch_data, trace_id=trace_id_for_ctx):
-            graph = TradingAgentsGraph(
-                selected_analysts=ta_config["selected_analysts"],
-                debug=False,
-                config=ta_config,
+            # 0.4.x: selected_analysts 从 config dict 键读;0.5.x: 顶层字段,config
+            # 是 pydantic TradingAgentsConfig。selected_analysts 两版都是构造参数。
+            graph_kwargs: dict[str, Any] = {
+                "debug": False,
+                "config": ta_config,
                 # callbacks 接受 langchain BaseCallbackHandler 列表;LLM 级别用
-                callbacks=[progress_handler] if progress_handler else None,
-            )
+                # (0.5.x 不接受 None,空时省略键)
+            }
+            if progress_handler is not None:
+                graph_kwargs["callbacks"] = [progress_handler]
+            analysts = ta_config.get("selected_analysts") if isinstance(ta_config, dict) else None
+            if analysts is None:
+                analysts = getattr(self, "analyst_types", None)
+            if analysts:
+                graph_kwargs["selected_analysts"] = analysts
+            graph = TradingAgentsGraph(**graph_kwargs)
 
             # 开 token 级流式(触发 on_llm_new_token → 前端聊天流)。
-            # pydantic 字段赋值;部分 provider 不支持 stream 时 langchain 会
-            # 走 on_llm_error 回调,流程仍可继续(文本兜底由 on_llm_end 全量输出)。
+            # 0.4.x: 实例属性可直接赋值;0.5.x: cached_property,通过
+            # __pydantic_private__ / 实例 __dict__ 塞入后生效(赋值失败则跳过,
+            # 文本兜底由 on_llm_end 全量输出)。
             if progress_handler is not None:
-                for _llm in (graph.quick_thinking_llm, graph.deep_thinking_llm):
+                for _llm_attr in ("quick_thinking_llm", "deep_thinking_llm"):
                     try:
+                        _llm = getattr(graph, _llm_attr)
                         _llm.streaming = True
                     except Exception as e:
                         logger.debug(f"[TA] 开启 LLM streaming 失败(忽略): {e}")
@@ -522,9 +533,24 @@ class TradingAgentsAgent(BaseAgent):
             ta_config
         )
 
+        # final_state 兼容:0.4.x 返回 dict;0.5.x 返回 pydantic AgentState 实例。
+        # AgentState 用 model_dump(排除 messages 等不可 JSON 化大对象也无妨,dict 化即可)。
+        if final_state is None:
+            state_dict: dict[str, Any] = {}
+        elif isinstance(final_state, dict):
+            state_dict = final_state
+        else:
+            try:
+                state_dict = dict(final_state.model_dump())
+            except Exception:
+                state_dict = {
+                    k: v for k, v in vars(final_state).items()
+                    if not k.startswith("_")
+                }
+
         return {
             "decision": str(decision or "HOLD").upper(),
-            "final_state": dict(final_state) if final_state else {},
+            "final_state": state_dict,
             "cost_usd": float(cost_usd or 0.0),
         }
 
@@ -597,11 +623,15 @@ class TradingAgentsAgent(BaseAgent):
                     continue
         return 0.0
 
-    def _fallback_cost_estimate(self, ta_config: dict) -> float:
-        """fallback 用 estimate 平均值。"""
+    def _fallback_cost_estimate(self, ta_config) -> float:
+        """fallback 用 estimate 平均值。ta_config 兼容 0.4 dict / 0.5 pydantic。"""
+        def _cfg(key: str, default=None):
+            if isinstance(ta_config, dict):
+                return ta_config.get(key, default)
+            return getattr(ta_config, key, default)
         est = estimate_cost(
-            debate_rounds=ta_config.get("max_debate_rounds", 1),
-            selected_analysts=ta_config.get("selected_analysts", []),
-            model=ta_config.get("deep_think_llm", "deepseek-chat"),
+            debate_rounds=_cfg("max_debate_rounds", 1),
+            selected_analysts=getattr(self, "analyst_types", []) or [],
+            model=_cfg("deep_think_llm", "deepseek-chat"),
         )
         return (est["cost_low_usd"] + est["cost_high_usd"]) / 2

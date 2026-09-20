@@ -9,9 +9,22 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pandas as pd
+import pytest
 
 from src.modules.automation.tradingagents import toolkit_adapter as ta
 from src.platform.marketdata.collectors.kline_collector import KlineCollector, KlineData
+
+# 0.4.x 专属内部模块(0.5.x 已删除 dataflows.interface/errors/market_data_validator/
+# stockstats_utils/y_finance)。这些路径下的 patch 在 0.5.x 不会被触发 — 对应测试 skip。
+try:
+    from tradingagents.dataflows.errors import NoMarketDataError  # noqa: F401
+    _HAS_TA_04_INTERNALS = True
+except ImportError:
+    _HAS_TA_04_INTERNALS = False
+
+requires_ta04 = pytest.mark.skipif(
+    not _HAS_TA_04_INTERNALS, reason="tradingagents>=0.5 删除了 0.4 内部 dataflows 模块"
+)
 
 
 def _sample_klines(n: int = 40) -> list[KlineData]:
@@ -98,6 +111,7 @@ def test_load_ohlcv_us_service_error_falls_back_to_marketdata(monkeypatch):
     assert len(out) == 10
 
 
+@requires_ta04
 def test_verified_snapshot_returns_unavailable_message_when_all_sources_fail(monkeypatch):
     """行情源全失败时，验证快照应返回不可用提示而非向 LangGraph 抛异常。"""
     from tradingagents.dataflows.errors import NoMarketDataError
@@ -113,6 +127,7 @@ def test_verified_snapshot_returns_unavailable_message_when_all_sources_fail(mon
     assert "Do not make exact price, indicator, stop-loss, or trade-action claims" in out
 
 
+@requires_ta04
 def test_verified_snapshot_preserves_indicators_argument_when_degraded(monkeypatch):
     """安全包装器必须保持上游的 indicators 参数，避免调用方因签名变化中断。"""
     from tradingagents.dataflows.errors import NoMarketDataError
@@ -133,6 +148,7 @@ def test_verified_snapshot_preserves_indicators_argument_when_degraded(monkeypat
     assert seen == {"indicators": ("rsi",)}
 
 
+@requires_ta04
 def test_install_load_ohlcv_patch_updates_yfinance_indicator_import(monkeypatch):
     """技术指标工具持有的 load_ohlcv 引用也必须接入同一个 US fallback。"""
     from tradingagents.dataflows import market_data_validator, stockstats_utils, y_finance
@@ -150,6 +166,7 @@ def test_install_load_ohlcv_patch_updates_yfinance_indicator_import(monkeypatch)
     assert y_finance.load_ohlcv is ta._panwatch_load_ohlcv
 
 
+@requires_ta04
 def test_load_ohlcv_a_share_no_klines_raises_not_fallback(monkeypatch):
     """A股取不到 K线时,直接抛 NoMarketDataError 报清晰错,**不回退 yfinance**。
 
@@ -171,6 +188,7 @@ def test_load_ohlcv_a_share_no_klines_raises_not_fallback(monkeypatch):
     assert real_calls["n"] == 0, "A股拉空不应回退 yfinance"
 
 
+@requires_ta04
 def test_route_to_vendor_degrades_on_upstream_error(monkeypatch):
     """上游 vendor 失败(如 FRED 无 key、polymarket SSL)应降级返回空,不抛错中断整轮分析。"""
 
@@ -181,3 +199,52 @@ def test_route_to_vendor_degrades_on_upstream_error(monkeypatch):
     # get_macro_indicators:首参是指标名(非 A股/港股) → 走上游 passthrough → boom → 降级空
     out = ta._patched_route_to_vendor("get_macro_indicators", "fed_funds_rate", "2026-06-18", 30)
     assert out == ""
+
+
+# ---------------------------------------------------------------------------
+# 0.5.x: dataflows 函数级 patch
+# ---------------------------------------------------------------------------
+def test_datafunc_patch_installed_for_05(monkeypatch):
+    """0.5.x: _ensure_datafunc_patched 把 yfinance/news 数据函数替换为拦截器。"""
+    try:
+        from tradingagents.dataflows import yfinance as ta_yf
+    except ImportError:
+        pytest.skip("tradingagents 0.5.x 未安装")
+
+    monkeypatch.setattr(ta, "_DATAFUNC_PATCHED", False)
+    monkeypatch.setattr(ta, "_DATAFUNC_REALS", {})
+    ta._ensure_datafunc_patched()
+
+    # 源模块与 tool 模块的引用都应是我们的包装器
+    from tradingagents.agents.utils import core_stock_tools
+    assert "get_yfin_data_online" in ta._DATAFUNC_REALS
+    assert core_stock_tools.get_yfin_data_online is not ta._DATAFUNC_REALS["get_yfin_data_online"]
+    # 清理,避免污染其他测试(进程级 patch 是运行时行为,测试里复原)
+    monkeypatch.undo()
+
+
+def test_patched_data_function_routes_crypto_to_panwatch(monkeypatch):
+    """0.5.x: 加密标的(BTC-USDT)的数据函数调用走 PanWatch,不触上游。"""
+    try:
+        from tradingagents.dataflows import yfinance as ta_yf
+    except ImportError:
+        pytest.skip("tradingagents 0.5.x 未安装")
+
+    monkeypatch.setattr(KlineCollector, "get_klines", lambda self, symbol, days=60: _sample_klines(10))
+
+    from src.modules.automation.tradingagents.toolkit_adapter import panwatch_data_context
+    with panwatch_data_context({"klines": _sample_klines(5)}, trace_id="t-test"):
+        out = ta._patched_data_function(
+            "get_yfin_data_online", "BTC-USDT", "2026-06-01", "2026-06-18"
+        )
+    assert "BTC-USDT" in out  # 返回的是 PanWatch K线 CSV(带标的头)
+
+
+def test_patched_data_function_passthrough_us(monkeypatch):
+    """0.5.x: 美股(AAPL)透传上游真函数。"""
+    sentinel = "AAPL,2026-06-18,1,2,3,4,100"
+    monkeypatch.setattr(
+        ta, "_DATAFUNC_REALS", {"get_fundamentals": lambda *a, **k: sentinel}
+    )
+    out = ta._patched_data_function("get_fundamentals", "AAPL", "2026-06-18")
+    assert out == sentinel

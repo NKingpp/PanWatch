@@ -1,4 +1,4 @@
-const API_BASE = '/api'
+export const API_BASE = '/api'
 const DEFAULT_TIMEOUT_MS = 20000
 
 interface ApiResponse<T> {

@@ -54,7 +54,7 @@ class TestLLMAdapter(unittest.TestCase):
         self.assertEqual(VALID_ANALYSTS, {"market", "social", "news", "fundamentals"})
 
     def test_build_ta_llm_config_basic(self):
-        """生成 TradingAgents config dict — 关键字段齐全"""
+        """生成 TradingAgents config — 关键字段齐全(0.4 dict / 0.5 pydantic 双兼容)"""
         ai_client = MagicMock()
         ai_client.base_url = "https://api.deepseek.com"
         ai_client.model = "deepseek-chat"
@@ -63,14 +63,23 @@ class TestLLMAdapter(unittest.TestCase):
         config = build_ta_llm_config(
             ai_client, debate_rounds=2, selected_analysts=["market", "news"]
         )
+
+        def _get(key):
+            return config[key] if isinstance(config, dict) else getattr(config, key, None)
+
         # 用 openrouter 走标准 chat completions,避开 OpenAI Responses API 的兼容性问题
-        self.assertEqual(config["llm_provider"], "openrouter")
-        self.assertEqual(config["backend_url"], "https://api.deepseek.com")
-        self.assertEqual(config["deep_think_llm"], "deepseek-chat")
-        self.assertEqual(config["max_debate_rounds"], 2)
-        self.assertEqual(set(config["selected_analysts"]), {"market", "news"})
-        self.assertEqual(config["output_language"], "Chinese")
-        self.assertFalse(config["checkpoint_enabled"])
+        self.assertEqual(_get("llm_provider"), "openrouter")
+        self.assertEqual(_get("deep_think_llm"), "deepseek-chat")
+        self.assertEqual(_get("max_debate_rounds"), 2)
+        # 0.4.x: selected_analysts/output_language/checkpoint_enabled 在 config dict
+        if isinstance(config, dict):
+            self.assertEqual(set(config["selected_analysts"]), {"market", "news"})
+            self.assertEqual(config["output_language"], "Chinese")
+            self.assertFalse(config["checkpoint_enabled"])
+        else:
+            # 0.5.x: selected_analysts 是 TradingAgentsGraph 构造参数,config 只有
+            # response_language(BCP-47);语言映射 Chinese → zh-CN
+            self.assertEqual(_get("response_language"), "zh-CN")
 
     def test_build_ta_llm_config_rejects_invalid_analyst(self):
         """非法分析师名 — 抛 ValueError"""
@@ -336,22 +345,25 @@ class TestPhaseBFeatures(unittest.TestCase):
             deep_model="claude-sonnet-4",
             quick_model="claude-haiku",
         )
-        self.assertEqual(cfg["deep_think_llm"], "claude-sonnet-4")
-        self.assertEqual(cfg["quick_think_llm"], "claude-haiku")
+        get = (lambda k: cfg[k]) if isinstance(cfg, dict) else (lambda k: getattr(cfg, k))
+        self.assertEqual(get("deep_think_llm"), "claude-sonnet-4")
+        self.assertEqual(get("quick_think_llm"), "claude-haiku")
 
     def test_quick_model_defaults_to_deep(self):
         """quick_model 未指定 — fallback 到 deep_model"""
         ai_client = MagicMock(base_url="x", model="m", api_key="k")
         cfg = build_ta_llm_config(ai_client, deep_model="claude-sonnet-4")
-        self.assertEqual(cfg["deep_think_llm"], "claude-sonnet-4")
-        self.assertEqual(cfg["quick_think_llm"], "claude-sonnet-4")
+        get = (lambda k: cfg[k]) if isinstance(cfg, dict) else (lambda k: getattr(cfg, k))
+        self.assertEqual(get("deep_think_llm"), "claude-sonnet-4")
+        self.assertEqual(get("quick_think_llm"), "claude-sonnet-4")
 
     def test_both_default_to_ai_client_model(self):
         """两个模型都未指定 — 都用 ai_client.model"""
         ai_client = MagicMock(base_url="x", model="default", api_key="k")
         cfg = build_ta_llm_config(ai_client)
-        self.assertEqual(cfg["deep_think_llm"], "default")
-        self.assertEqual(cfg["quick_think_llm"], "default")
+        get = (lambda k: cfg[k]) if isinstance(cfg, dict) else (lambda k: getattr(cfg, k))
+        self.assertEqual(get("deep_think_llm"), "default")
+        self.assertEqual(get("quick_think_llm"), "default")
 
     def test_agent_init_has_new_phase_b_fields(self):
         """Agent 实例化 — Phase B 新增字段都正确暴露"""

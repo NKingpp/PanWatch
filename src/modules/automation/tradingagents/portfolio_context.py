@@ -165,15 +165,15 @@ def build_portfolio_context(
 
 
 def patch_propagator(graph, portfolio_context_text: str) -> None:
-    """猴补 TradingAgentsGraph.propagator.create_initial_state,把 portfolio context
-    拼到 past_context 前面。
+    """把 portfolio context 注入 TradingAgents 运行(跨版本双通道)。
 
-    安全性:
-    - past_context 是 TradingAgents 上游公开的扩展通道(agent_states.py:73 已标注为
-      Memory log context injected at run start)
-    - 上游 PortfolioManager 直接读这个字段并拼到 prompt,我们注入即被 PM 看到
-    - 不动 prompt 模板、不动 LLM、不动 node 创建逻辑
-    - 跨版本稳定 — 字段是 typed schema,即使上游重命名也会保留兼容
+    0.4.x: 猴补 propagator.create_initial_state,把 context 拼到 past_context
+    (上游公开扩展通道,PortfolioManager 节点读取)。
+
+    0.5.x: past_context 字段已删,ResearchManager 节点产出 investment_plan →
+    trader/risk 全链引用。改为猴补 graph 上的 research_manager 节点输出:
+    在 investment_plan 前插入持仓上下文(trader_user prompt 的 {investment_plan}
+    占位直接渲染,内容对 trader + risk judge 可见)。
 
     Args:
         graph: TradingAgentsGraph 实例(已经 __init__ 完成)
@@ -183,19 +183,62 @@ def patch_propagator(graph, portfolio_context_text: str) -> None:
         return  # 没东西要注入,跳过 patch
 
     propagator = getattr(graph, "propagator", None)
-    if propagator is None or not hasattr(propagator, "create_initial_state"):
-        logger.warning("[TA portfolio] propagator.create_initial_state 不存在,跳过注入")
+
+    # 0.4.x 通道:create_initial_state 接受 past_context
+    if propagator is not None and hasattr(propagator, "create_initial_state"):
+        import inspect
+        try:
+            sig = inspect.signature(propagator.create_initial_state)
+            accepts_past = "past_context" in sig.parameters
+        except (TypeError, ValueError):
+            accepts_past = False
+        if accepts_past:
+            original = propagator.create_initial_state
+
+            def _patched(company_name: str, trade_date: str, past_context: str = "", **kwargs: Any):
+                merged = portfolio_context_text
+                if past_context:
+                    merged = f"{merged}\n\n---\n\n{past_context}"
+                return original(company_name, trade_date, past_context=merged, **kwargs)
+
+            propagator.create_initial_state = _patched  # type: ignore[method-assign]
+            logger.info(
+                f"[TA portfolio] 已注入 portfolio context ({len(portfolio_context_text)} 字符) "
+                "到 past_context (0.4.x 通道)"
+            )
+            return
+
+    # 0.5.x 通道:wrap research_manager 节点,在 investment_plan 前插持仓上下文
+    try:
+        g = graph.graph  # CompiledStateGraph
+        rm_node = getattr(g, "nodes", {}).get("Research Manager")
+    except Exception as e:
+        logger.warning(f"[TA portfolio] 0.5.x 注入失败: {e}")
+        return
+    if rm_node is None:
+        logger.warning("[TA portfolio] Research Manager 节点未找到,跳过注入")
         return
 
-    original = propagator.create_initial_state
+    original_func = getattr(rm_node, "func", rm_node)
 
-    def _patched(company_name: str, trade_date: str, past_context: str = "", **kwargs: Any):
-        merged = portfolio_context_text
-        if past_context:
-            merged = f"{merged}\n\n---\n\n{past_context}"
-        return original(company_name, trade_date, past_context=merged, **kwargs)
+    def _wrapped_rm(state: Any, *args: Any, **kwargs: Any):
+        result = original_func(state, *args, **kwargs)
+        try:
+            if isinstance(result, dict) and result.get("investment_plan"):
+                result["investment_plan"] = (
+                    f"[User Portfolio Context]\n{portfolio_context_text}\n\n"
+                    f"[Research Manager Plan]\n{result['investment_plan']}"
+                )
+        except Exception:
+            pass
+        return result
 
-    propagator.create_initial_state = _patched  # type: ignore[method-assign]
+    try:
+        rm_node.func = _wrapped_rm  # type: ignore[attr-defined]
+    except Exception:
+        logger.warning("[TA portfolio] 节点 func 替换失败,跳过注入")
+        return
     logger.info(
-        f"[TA portfolio] 已注入 portfolio context ({len(portfolio_context_text)} 字符) 到 past_context"
+        f"[TA portfolio] 已注入 portfolio context ({len(portfolio_context_text)} 字符) "
+        "到 investment_plan (0.5.x 通道)"
     )

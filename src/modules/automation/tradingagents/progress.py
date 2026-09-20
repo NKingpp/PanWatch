@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any
 
@@ -18,6 +19,26 @@ from src.platform.observability.log_context import log_context
 from src.platform.observability import otel
 
 logger = logging.getLogger(__name__)
+
+# ---- 活跃 handler 注册表:trace_id -> handler(供停止分析联动取消) ----
+_active_handlers: dict[str, "PanWatchProgressHandler"] = {}
+_active_handlers_lock = threading.Lock()
+
+
+def cancel_handler(trace_id: str) -> bool:
+    """按 trace_id 取消活跃分析进度。返回是否找到 handler。"""
+    with _active_handlers_lock:
+        h = _active_handlers.get(trace_id)
+        if h is None:
+            return False
+        h.cancel()
+        return True
+
+
+def active_trace_ids() -> list[str]:
+    """当前活跃(可取消)的 trace_id 列表。"""
+    with _active_handlers_lock:
+        return list(_active_handlers.keys())
 
 
 # 默认阶段映射:TradingAgents 4 个 analyst + 辩论 + 风控 + PM
@@ -91,19 +112,34 @@ class PanWatchProgressHandler(_LCBaseCallbackHandler):
         self._total_cost = 0.0
         self._completed_stages: set[str] = set()
         self._current_stage: str = ""     # on_chain_start 设置,on_chain_end 清空
+        self._last_stage: str = ""        # 最近一次 on_chain_start 的 stage(llm 归属兜底)
         self._stream_buffer: list[str] = []  # token 缓冲(streaming 可用时)
+        self._cancelled = False              # 协作式取消:置位后所有回调 no-op
         # OTel 桥接:handler 在异步侧构造(to_thread 之前),此处捕获当前上下文,
         # 供工作线程里的 callback 把节点/LLM 子 span 挂到 root span 下(关闭时为 None)。
         self._otel_parent = otel.capture_context()
         self._otel_stage_spans: dict[str, Any] = {}
         self._otel_llm_span: Any = None
+        # 注册到全局表,供停止分析按 trace_id 取消
+        with _active_handlers_lock:
+            _active_handlers[self.trace_id] = self
 
     @property
     def elapsed_sec(self) -> float:
         return time.monotonic() - self._started_at
 
+    def cancel(self) -> None:
+        """请求取消:后续所有回调 no-op(分析线程自然跑完或尽早短路)。"""
+        self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
     def _emit(self, stage: str, action: str, **extra):
         """写一条进度日志。前端按 trace_id + event=ta_progress 拉。"""
+        if self._cancelled:
+            return
         with log_context(
             trace_id=self.trace_id,
             agent_name=self.agent_name,
@@ -120,7 +156,9 @@ class PanWatchProgressHandler(_LCBaseCallbackHandler):
 
     def _emit_llm_text(self, action: str, text: str, **extra) -> None:
         """写一条 LLM 输出文本事件(带当前角色名),供前端聊天流渲染。"""
-        stage = self._current_stage or "llm_call"
+        if self._cancelled:
+            return
+        stage = self._current_stage or self._last_stage or "llm_call"
         with log_context(
             trace_id=self.trace_id,
             agent_name=self.agent_name,
@@ -190,7 +228,8 @@ class PanWatchProgressHandler(_LCBaseCallbackHandler):
             call_cost=round(cost, 6),
         )
         # 输出该次 LLM 完整文本(带角色名) → 前端聊天流渲染。
-        # streaming 可用时 token 事件已实时推送,这里仍发一份完整版兜底(幂等,前端按 action 分流)。
+        # 先 flush token 缓冲残余(避免与全量文本重复),再发全量兜底。
+        self._flush_stream_buffer(final=True)
         text = self._llm_text(response)
         if text:
             self._emit_llm_text("llm_text", text)
@@ -208,7 +247,7 @@ class PanWatchProgressHandler(_LCBaseCallbackHandler):
 
     def on_llm_new_token(self, token: str, **kwargs):
         """token 级流式回调(LLM streaming=True 时触发)。缓冲攒批写日志,避免每 token 一条。"""
-        if not token:
+        if self._cancelled or not token:
             return
         self._stream_buffer.append(str(token))
         if sum(len(t) for t in self._stream_buffer) >= 80:
@@ -243,8 +282,11 @@ class PanWatchProgressHandler(_LCBaseCallbackHandler):
         stage = _normalize_stage(name)
         if not stage:
             return
+        # 每次都刷新当前角色:同一节点可能多次 start(如多轮辩论),
+        # _current_stage 供 llm_token/llm_text 归属角色,必须实时跟进
+        self._current_stage = stage
+        self._last_stage = stage
         if stage not in self._completed_stages:
-            self._current_stage = stage
             self._emit(stage, "stage_start", langgraph_node=name,
                        stage_label=STAGE_DISPLAY.get(stage, stage))
             # OTel:TradingAgents 节点 -> 子 span(挂到 root span 下)。
@@ -266,10 +308,11 @@ class PanWatchProgressHandler(_LCBaseCallbackHandler):
         if stage:
             self._flush_stream_buffer(final=True)  # 收尾:把 token 缓冲残余推完
             self._completed_stages.add(stage)
-            if self._current_stage == stage:
-                self._current_stage = ""
             self._emit(stage, "stage_end", langgraph_node=name,
                        stage_label=STAGE_DISPLAY.get(stage, stage))
+            # 注意:不清空 _current_stage。langchain 回调时序里 llm_end 常晚于
+            # 对应节点的 chain_end 到达,清空会让 llm_text 归属到 llm_call(无角色名),
+            # 前端聊天流无法按角色渲染。保留最后一次 stage 作为兜底归属。
             # OTel:结束该节点 span。
             span = self._otel_stage_spans.pop(stage, None)
             if span is not None:
@@ -492,5 +535,10 @@ def build_progress_snapshot(db, trace_id: str) -> dict:
         status = "not_found"
 
     progress["trace_id"] = trace_id
+    # 取消检测:活跃 handler 已被取消 → 终态 cancelled(SSE 尽快关流)
+    with _active_handlers_lock:
+        h = _active_handlers.get(trace_id)
+    if h is not None and getattr(h, "cancelled", False) and status == "running":
+        status = "cancelled"
     progress["status"] = status
     return progress

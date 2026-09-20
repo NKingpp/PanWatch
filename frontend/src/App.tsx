@@ -39,10 +39,10 @@ const navItems = [
   { to: '/datasources', icon: Database, label: '数据源' },
   { to: '/settings', icon: Settings, label: '设置' },
 ]
-const desktopPrimaryNavItems = navItems.slice(0, 5)
-const desktopMoreNavItems = navItems.slice(5)
-const mobilePrimaryNavItems = navItems.slice(0, 5)
-const mobileMoreNavItems = navItems.slice(5)
+const desktopPrimaryNavItems = [...navItems.slice(0, 5), navItems[7]]
+const desktopMoreNavItems = navItems.slice(5).filter(n => n.to !== '/okx-agent')
+const mobilePrimaryNavItems = [navItems[0], navItems[1], navItems[2], navItems[3], navItems[7], navItems[4]]
+const mobileMoreNavItems = navItems.slice(5).filter(n => n.to !== '/okx-agent')
 
 // 认证守卫组件
 function RequireAuth({ children }: { children: React.ReactNode }) {

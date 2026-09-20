@@ -2044,6 +2044,19 @@ CREATE TABLE ta_trade_strategies (
         "ix_ta_trade_strategies_inst_id",
         "CREATE INDEX ix_ta_trade_strategies_inst_id ON ta_trade_strategies(inst_id)",
     )
+    # 历史详情增强:分析时价格/模型/耗时(hold 也落库为 skip 记录)
+    _add_column_if_missing(
+        conn, "ta_trade_strategies", "price_at_analysis",
+        "ALTER TABLE ta_trade_strategies ADD COLUMN price_at_analysis REAL",
+    )
+    _add_column_if_missing(
+        conn, "ta_trade_strategies", "model_label",
+        "ALTER TABLE ta_trade_strategies ADD COLUMN model_label TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column_if_missing(
+        conn, "ta_trade_strategies", "duration_ms",
+        "ALTER TABLE ta_trade_strategies ADD COLUMN duration_ms INTEGER",
+    )
 
 
 def _m129_okx_algo_trading(conn: Connection) -> None:

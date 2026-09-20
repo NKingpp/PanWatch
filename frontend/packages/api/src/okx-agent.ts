@@ -1,4 +1,4 @@
-import { fetchAPI, getToken } from './client'
+import { API_BASE, fetchAPI, getToken } from './client'
 
 export interface OKXAgentStatus {
   enabled: boolean
@@ -122,16 +122,51 @@ export interface TAStrategy {
   reason: string
   trace_id: string
   analysis_date: string
-  status: 'pending' | 'approved' | 'executed' | 'rejected' | 'failed' | 'expired'
+  status: 'pending' | 'approved' | 'executed' | 'rejected' | 'failed' | 'expired' | 'skip'
   ord_id: string | null
   error_msg: string
   created_at: string
   updated_at: string
+  price_at_analysis?: number | null
+  model_label?: string
+  duration_ms?: number | null
 }
 
-export const triggerOKXAnalysis = (instId: string) =>
-  fetchAPI<{ queued: boolean; inst_id: string; trace_id: string; message: string }>(
-    '/okx-agent/analyze',
+/** 触发深度分析;已在分析中(409)时抛 AnalyzeConflictError(带 trace_id 供接管 SSE)。 */
+export class AnalyzeConflictError extends Error {
+  traceId: string
+  constructor(message: string, traceId: string) {
+    super(message)
+    this.name = 'AnalyzeConflictError'
+    this.traceId = traceId
+  }
+}
+
+export const triggerOKXAnalysis = async (instId: string) => {
+  const token = getToken()
+  const res = await fetch(`${API_BASE}/okx-agent/analyze`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ inst_id: instId }),
+  })
+  if (res.status === 409) {
+    // 已在分析中:后端 X-Trace-Id 返回进行中的 trace,前端接管 SSE
+    const traceId = res.headers.get('X-Trace-Id') || ''
+    throw new AnalyzeConflictError(`${instId} 深度分析进行中,已重新连接实时流`, traceId)
+  }
+  const body = await res.json().catch(() => null)
+  if (!res.ok || !body || body.code !== 0) {
+    throw new Error(body?.message || `HTTP ${res.status}`)
+  }
+  return body.data as { queued: boolean; inst_id: string; trace_id: string; message: string }
+}
+
+export const stopOKXAnalysis = (instId: string) =>
+  fetchAPI<{ inst_id: string; accepted: boolean; message: string }>(
+    '/okx-agent/analyze/stop',
     { method: 'POST', body: JSON.stringify({ inst_id: instId }) },
   )
 
@@ -219,7 +254,7 @@ export async function streamOKXAnalyzeProgress(
 }
 
 export const getOKXAnalyzeStatus = (instId: string) =>
-  fetchAPI<{ inst_id: string; analyzing: boolean }>(
+  fetchAPI<{ inst_id: string; analyzing: boolean; trace_id: string }>(
     `/okx-agent/analyze/status?inst_id=${encodeURIComponent(instId)}`,
   )
 

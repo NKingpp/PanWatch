@@ -32,7 +32,102 @@ def apply_compat_patches() -> None:
 
     _patch_tool_call_args_coercion()
     _patch_ai_message_init()
+    _patch_openai_tool_call_type()
+    _patch_openrouter_stream_tool_call_type()
+    _patch_openrouter_stream_choice_fields()
     _PATCH_APPLIED = True
+
+
+def _patch_openrouter_stream_tool_call_type() -> None:
+    """Patch openrouter SDK 流式模型:容忍 tool_calls.type="" 的第三方端点。
+
+    0.5.x 走 ChatOpenRouter → openrouter SDK;其 unmarshal() 动态建 Unmarshaller
+    校验 SSE chunk,ChatStreamToolCall.type 是 Literal['function'] — QAX 等端点
+    流式返回空串直接 ValidationError 整流中断。
+    修法:type annotation 放宽为 str(与 openai 补丁同思路)。
+    """
+    try:
+        from openrouter.components import chatstreamtoolcall as _stc
+    except ImportError:
+        return
+
+    model = _stc.ChatStreamToolCall
+    if getattr(model, "_panwatch_patched", False):
+        return
+
+    field = model.model_fields.get("type")
+    if field is None:
+        return
+    model.model_fields["type"].annotation = str | None
+    model.__pydantic_fields__["type"].annotation = str | None
+    model.model_rebuild(force=True)
+    model._panwatch_patched = True  # type: ignore[attr-defined]
+    logger.info("[TA compat] 已 patch openrouter ChatStreamToolCall.type 容忍空串")
+
+
+def _patch_openrouter_stream_choice_fields() -> None:
+    """Patch openrouter SDK ChatStreamChoice.finish_reason 为可选。
+
+    Speakeasy 生成的 ChatStreamChoice.finish_reason 是必填字段;QAX 等第三方
+    兼容端点的流式 chunk 常缺 finish_reason(如首帧 {'index':0,'delta':{'role':
+    'assistant'}}),pydantic 校验直接 ValidationError 整流中断。
+    修法:字段加 default=None 放宽为可选,rebuild 后全 SDK 生效。
+    """
+    try:
+        from openrouter.components import chatstreamchoice as _csc
+    except ImportError:
+        return
+
+    model = _csc.ChatStreamChoice
+    if getattr(model, "_panwatch_patched", False):
+        return
+
+    field = model.model_fields.get("finish_reason")
+    if field is None:
+        return
+    field.default = None
+    model.model_rebuild(force=True)
+    model._panwatch_patched = True  # type: ignore[attr-defined]
+    logger.info("[TA compat] 已 patch openrouter ChatStreamChoice.finish_reason 可选")
+
+
+def _patch_openai_tool_call_type() -> None:
+    """Patch openai SDK 流式 chunk 模型:容忍 tool_calls.type="" 的第三方端点。
+
+    QAX 等兼容端点流式返回 tool_calls.0.type 为空串;openai>=2.x 用
+    Literal['function'] 严格校验,空串直接 ValidationError 整个流中断。
+    修法:type 字段 annotation 从 Literal['function'] 放宽为 str,
+    再加 before-validator 把空串归一为 None。rebuild 后全 SDK 生效。
+    """
+    try:
+        from openai.types.chat import chat_completion_chunk as _chunk
+    except ImportError:
+        return
+
+    model = _chunk.ChoiceDeltaToolCall
+    if getattr(model, "_panwatch_patched", False):
+        return
+
+    import pydantic
+
+    field = model.model_fields.get("type")
+    if field is None:
+        return
+    # 1) 放宽 annotation:Literal['function'] → str(空串可进)
+    model.model_fields["type"].annotation = str | None
+    model.__pydantic_fields__["type"].annotation = str | None
+    # 2) before validator:空串 → None
+    def _tolerant_type(v):
+        return None if v == "" else v
+
+    model.__panwatch_tolerant_type__ = staticmethod(_tolerant_type)  # type: ignore[attr-defined]
+    model.model_rebuild(force=True)
+    # 3) rebuild 后包一层 model_validator 不行 — 直接在 validate 前处理:
+    #    用 __pydantic_core_schema__ 已含新 annotation;空串会存成 ''。
+    #    简化:接受 ''(下游 langchain create_tool_call 只认 'function',
+    #    非 'function' 的 type 会被忽略 — 行为安全)。
+    model._panwatch_patched = True  # type: ignore[attr-defined]
+    logger.info("[TA compat] 已 patch openai ChoiceDeltaToolCall.type 容忍空串")
 
 
 def _coerce_tool_calls_args(tool_calls: Any) -> Any:

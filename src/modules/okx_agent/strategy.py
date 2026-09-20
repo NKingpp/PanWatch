@@ -31,35 +31,41 @@ def _load_raw_data(analysis: dict) -> dict:
 
 
 def create_strategy_from_analysis(db: Session, inst_id: str, analysis: dict) -> dict | None:
-    """从 TradingAgents AnalysisHistory 记录生成 pending 策略。
+    """从 TradingAgents AnalysisHistory 记录生成策略记录。
 
     analysis: /api/agents/tradingagents/latest 返回结构(含 raw_data)。
-    hold / review 评级不生成可执行策略,返回 None。
+    buy/sell → pending 待人工确认;hold/review → skip 记录(历史可查,不可执行)。
     """
     raw = _load_raw_data(analysis)
     sug = raw.get("suggestion") or {}
     action = (sug.get("action") or "").lower()
-    if action not in ("buy", "sell"):
+    if action not in ("buy", "sell", "hold", "review"):
         return None
 
-    # 数量留空,审批时用户填(或用默认仓位规则);价格留空 = 市价单
+    is_executable = action in ("buy", "sell")
     result = db.execute(
         text("""
 INSERT INTO ta_trade_strategies
     (inst_id, action, action_label, rating_raw, confidence, ord_type, td_mode,
-     sz, px, reason, trace_id, analysis_date, status)
+     sz, px, reason, trace_id, analysis_date, status,
+     price_at_analysis, model_label, duration_ms)
 VALUES (:iid, :act, :alabel, :rating, :conf, 'market', 'cash', '', '',
-        :reason, :trace, :adate, 'pending')
+        :reason, :trace, :adate, :status,
+        :price, :model, :dur)
 """),
         {
             "iid": inst_id,
             "act": action,
-            "alabel": sug.get("action_label") or "",
+            "alabel": sug.get("action_label") or action,
             "rating": sug.get("rating_raw") or "",
             "conf": float(sug.get("confidence") or 0),
             "reason": (sug.get("reason") or "")[:2000],
             "trace": analysis.get("trace_id") or "",
             "adate": analysis.get("analysis_date") or "",
+            "status": "pending" if is_executable else "skip",
+            "price": float(raw.get("price_at_analysis") or 0) or None,
+            "model": analysis.get("model_label") or "",
+            "dur": int(analysis.get("duration_ms") or 0) or None,
         },
     )
     sid = int(result.lastrowid or 0)
@@ -69,7 +75,8 @@ VALUES (:iid, :act, :alabel, :rating, :conf, 'market', 'cash', '', '',
 
 _COLS = (
     "id, inst_id, action, action_label, rating_raw, confidence, ord_type, td_mode, "
-    "sz, px, reason, trace_id, analysis_date, status, ord_id, error_msg, created_at, updated_at"
+    "sz, px, reason, trace_id, analysis_date, status, ord_id, error_msg, created_at, updated_at, "
+    "price_at_analysis, model_label, duration_ms"
 )
 
 
@@ -135,6 +142,10 @@ WHERE id = :i
 
 _analyze_threads: dict[str, threading.Thread] = {}
 _analyze_lock = threading.Lock()
+# 协作式取消:inst_id -> True。分析线程在关键节点检查,置位后跳过策略生成。
+_analyze_cancels: dict[str, bool] = {}
+# 进行中分析对应的 trace_id(前端 409/挂载时恢复 SSE 用)
+_analyze_traces: dict[str, str] = {}
 
 
 def is_analyzing(inst_id: str) -> bool:
@@ -143,8 +154,29 @@ def is_analyzing(inst_id: str) -> bool:
         return bool(t and t.is_alive())
 
 
-def spawn_analysis(inst_id: str, runner) -> None:
-    """启动后台分析线程,完成后自动清理。runner: 零参回调。"""
+def current_trace_id(inst_id: str) -> str:
+    """该交易对进行中分析对应的 trace_id(无则空串)。"""
+    with _analyze_lock:
+        return _analyze_traces.get(inst_id, "")
+
+
+def cancel_analysis(inst_id: str) -> bool:
+    """请求取消指定交易对的分析。返回是否处于分析中。"""
+    with _analyze_lock:
+        t = _analyze_threads.get(inst_id)
+        analyzing = bool(t and t.is_alive())
+        if analyzing:
+            _analyze_cancels[inst_id] = True
+        return analyzing
+
+
+def is_cancelled(inst_id: str) -> bool:
+    with _analyze_lock:
+        return bool(_analyze_cancels.get(inst_id))
+
+
+def spawn_analysis(inst_id: str, runner, trace_id: str = "") -> None:
+    """启动后台分析线程,完成后自动清理。runner: 零参回调;trace_id 供前端恢复 SSE。"""
     def _wrap():
         try:
             runner()
@@ -153,8 +185,12 @@ def spawn_analysis(inst_id: str, runner) -> None:
         finally:
             with _analyze_lock:
                 _analyze_threads.pop(inst_id, None)
+                _analyze_cancels.pop(inst_id, None)
+                _analyze_traces.pop(inst_id, None)
 
     with _analyze_lock:
         t = threading.Thread(target=_wrap, name=f"ta-strategy-{inst_id}", daemon=True)
         _analyze_threads[inst_id] = t
+        if trace_id:
+            _analyze_traces[inst_id] = trace_id
         t.start()

@@ -214,7 +214,12 @@ def analyze_inst(body: AnalyzeBody, db: Session = Depends(get_db)):
         raise HTTPException(400, "inst_id 必须是 OKX 交易对(如 BTC-USDT)")
 
     if ta_strategy.is_analyzing(inst_id):
-        raise HTTPException(409, f"{inst_id} 深度分析进行中,请等待完成")
+        running_trace = ta_strategy.current_trace_id(inst_id)
+        raise HTTPException(
+            409,
+            f"{inst_id} 深度分析进行中,已为你重新连接实时流",
+            headers={"X-Trace-Id": running_trace},
+        )
 
     from src.modules.automation.tradingagents.toolkit_adapter import is_crypto
     if not is_crypto(inst_id):
@@ -227,7 +232,7 @@ def analyze_inst(body: AnalyzeBody, db: Session = Depends(get_db)):
     def _run():
         asyncio.run(_run_ta_analysis(inst_id, trace_id))
 
-    ta_strategy.spawn_analysis(inst_id, _run)
+    ta_strategy.spawn_analysis(inst_id, _run, trace_id=trace_id)
     return {"queued": True, "inst_id": inst_id, "trace_id": trace_id,
             "message": "深度分析已提交,预计 3-5 分钟"}
 
@@ -251,6 +256,9 @@ async def _run_ta_analysis(inst_id: str, trace_id: str) -> None:
         return
 
     # 分析完成 → 读最新结果生成策略
+    if ta_strategy.is_cancelled(inst_id):
+        logger.info(f"[TA策略] {inst_id} 分析已被用户取消,跳过策略生成")
+        return
     from src.platform.persistence.database import SessionLocal
     db = SessionLocal()
     try:
@@ -274,12 +282,25 @@ async def _run_ta_analysis(inst_id: str, trace_id: str) -> None:
             if not isinstance(rec.analysis_date, str) else str(rec.analysis_date),
             "trace_id": trace_id,
         }
+        # 补充模型标签/耗时(从 AgentRun 取,历史策略展示用)
+        from src.platform.persistence.models import AgentRun
+        run = (
+            db.query(AgentRun)
+            .filter(AgentRun.trace_id == trace_id)
+            .order_by(AgentRun.id.desc())
+            .first()
+        )
+        if run:
+            analysis["model_label"] = run.model_label or ""
+            analysis["duration_ms"] = int(run.duration_ms or 0)
         sug = (rec.raw_data or {}).get("suggestion") or {}
         created = ta_strategy.create_strategy_from_analysis(db, inst_id, analysis)
-        if created:
+        if created and created.get("status") == "pending":
             # 按账户资金自动决策仓位大小(现货:可用 USDT × 置信度映射比例)
             _auto_size_position(db, created)
             logger.info(f"[TA策略] {inst_id} 生成策略 #{created['id']} action={created['action']}")
+        elif created:
+            logger.info(f"[TA策略] {inst_id} 决策为 {created['action']},记录为 skip(无可执行策略)")
         else:
             logger.info(f"[TA策略] {inst_id} 决策为 {sug.get('action')} ,无可执行策略")
     finally:
@@ -347,6 +368,7 @@ def _auto_size_position(db: Session, strategy: dict) -> None:
                     f" 不足最小下单量({spec.min_sz})"
                 )
         elif action == "sell":
+            # 合约持仓优先;现货"持仓"就是余额(positions 接口只有合约)
             pos = snap.position_of(inst_id)
             held = 0.0
             if pos:
@@ -354,10 +376,12 @@ def _auto_size_position(db: Session, strategy: dict) -> None:
                     held = abs(float(pos.get("pos") or 0))
                 except (TypeError, ValueError):
                     held = 0.0
+            if held <= 0 and spec.inst_type == "SPOT":
+                held = float(snap.available_ccy.get(base_ccy) or 0)
             if held > 0:
                 sz = _align_sz(held, spec.lot_sz, spec.min_sz)
             else:
-                logger.info(f"[TA策略] #{sid} sell 但无 {inst_id} 持仓,sz 留空")
+                logger.info(f"[TA策略] #{sid} sell 但无 {inst_id} 持仓/余额,sz 留空")
 
         if sz:
             db.execute(
@@ -406,9 +430,36 @@ def list_strategies(
 
 @router.get("/analyze/status")
 def analyze_status(inst_id: str):
-    """查询某交易对是否在分析中(前端按钮态)。"""
+    """查询某交易对是否在分析中(前端按钮态 + 恢复 SSE 用 trace_id)。"""
     iid = (inst_id or "").strip().upper()
-    return {"inst_id": iid, "analyzing": ta_strategy.is_analyzing(iid)}
+    analyzing = ta_strategy.is_analyzing(iid)
+    return {
+        "inst_id": iid,
+        "analyzing": analyzing,
+        "trace_id": ta_strategy.current_trace_id(iid) if analyzing else "",
+    }
+
+
+@router.post("/analyze/stop")
+def stop_analysis(body: AnalyzeBody, db: Session = Depends(get_db)):
+    """停止指定交易对的深度分析(协作式取消)。
+
+    - 置取消标志:分析线程不再生成策略、进度 handler 不再发事件;
+    - 在途 LLM/工具调用无法硬中断(线程 daemon,自然跑完即回收);
+    - 返回 accepted: 是否找到了进行中的分析。
+    """
+    inst_id = (body.inst_id or "").strip().upper()
+    if not inst_id:
+        raise HTTPException(400, "inst_id 不能为空")
+    accepted = ta_strategy.cancel_analysis(inst_id)
+    # 联动取消该交易对所有活跃 trace 的进度 handler(不再发新事件)
+    if accepted:
+        from src.modules.automation.tradingagents.progress import active_trace_ids, cancel_handler
+        for tid in active_trace_ids():
+            if tid.startswith(f"okx-ta-{inst_id}-"):
+                cancel_handler(tid)
+    return {"inst_id": inst_id, "accepted": accepted,
+            "message": "已请求取消" if accepted else "该交易对当前无进行中的分析"}
 
 
 # 进度 SSE 复用 automation 模块的节奏/终态约定
@@ -450,6 +501,7 @@ async def stream_analyze_progress(trace_id: str):
         last_payload = ""
         started = _time.monotonic()
         idle_ticks = 0
+        not_found_since: float | None = None  # not_found 宽限:分析线程启动需 ~10s 才写首事件
         while _time.monotonic() - started < PROGRESS_SSE_MAX_DURATION_SEC:
             try:
                 progress = await asyncio.to_thread(_snapshot)
@@ -470,9 +522,20 @@ async def stream_analyze_progress(trace_id: str):
                     idle_ticks = 0
                     yield format_sse_comment()
 
-            if progress.get("status") in ("success", "failed", "stale", "not_found"):
+            status = progress.get("status")
+            if status == "not_found":
+                # 刚触发的分析,后台线程还在预热(拉行情 ~10s),宽限 30s 再判终态
+                if not_found_since is None:
+                    not_found_since = _time.monotonic()
+                if _time.monotonic() - not_found_since < 30:
+                    await asyncio.sleep(PROGRESS_SSE_POLL_SEC)
+                    continue
+            elif not_found_since is not None:
+                not_found_since = None
+
+            if status in ("success", "failed", "stale", "not_found", "cancelled"):
                 seq += 1
-                yield format_sse_event(seq, "done", {"status": progress.get("status")})
+                yield format_sse_event(seq, "done", {"status": status})
                 return
             await asyncio.sleep(PROGRESS_SSE_POLL_SEC)
 
@@ -519,7 +582,8 @@ def approve_strategy(strategy_id: int, body: ApproveBody, db: Session = Depends(
         sz=sz,
         px=body.px,
         td_mode=body.td_mode,
-        cl_ord_id=f"ta-s{strategy_id}",
+        cl_ord_id=f"tas{strategy_id}",  # OKX 51000:clOrdId 仅允许字母数字,不能带 '-'
+
     )
     try:
         import json as _json
@@ -544,6 +608,55 @@ def reject_strategy(strategy_id: int, db: Session = Depends(get_db)):
         raise HTTPException(409, f"策略状态为 {rec['status']},仅 pending 可拒绝")
     ta_strategy.update_strategy_status(db, strategy_id, "rejected")
     return {"strategy_id": strategy_id, "status": "rejected"}
+
+
+@router.post("/strategies/mock")
+def mock_strategy(body: MockStrategyBody, db: Session = Depends(get_db)):
+    """测试后门:手工造一条 pending 策略,跳过 LLM 直接测 人工确认→下单 全链路。
+
+    仅当 OKX_AGENT_SIMULATED 开启时可用,防止真实资金误操作。
+    造出的策略走正常 approve 流程(含自动仓位计算)。
+    """
+    if not simulated_from_env():
+        raise HTTPException(403, "仅模拟盘模式可 mock 策略")
+    if not _agent_enabled(db):
+        raise HTTPException(403, "Agent 自动交易已关闭")
+
+    inst_id = (body.inst_id or "").strip().upper()
+    action = (body.action or "").strip().lower()
+    if not inst_id or "-" not in inst_id:
+        raise HTTPException(400, "inst_id 必须是 OKX 交易对(如 BTC-USDT)")
+    if action not in ("buy", "sell"):
+        raise HTTPException(400, "action 只能是 buy / sell")
+
+    result = db.execute(
+        text("""
+INSERT INTO ta_trade_strategies
+    (inst_id, action, action_label, rating_raw, confidence, ord_type, td_mode,
+     sz, px, reason, trace_id, analysis_date, status)
+VALUES (:iid, :act, :alabel, 'BUY', 8.0, 'market', 'cash', '', '',
+        :reason, '', date('now'), 'pending')
+"""),
+        {
+            "iid": inst_id,
+            "act": action,
+            "alabel": "buy" if action == "buy" else "sell",
+            "reason": "[测试] 手工 mock 策略,用于验证人工确认→下单链路",
+        },
+    )
+    sid = int(result.lastrowid or 0)
+    db.commit()
+
+    created = ta_strategy.get_strategy(db, sid)
+    if created:
+        _auto_size_position(db, created)  # 与真实分析同路径:按账户资金×置信度算仓位
+        created = ta_strategy.get_strategy(db, sid)
+    return {"strategy_id": sid, "mock": True, "strategy": created}
+
+
+class MockStrategyBody(BaseModel):
+    inst_id: str
+    action: str = "buy"
 
 
 # ==================== 策略委托(Algo Trading) ====================

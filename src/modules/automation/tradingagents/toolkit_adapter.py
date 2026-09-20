@@ -159,7 +159,7 @@ def _yfinance_response_has_data(text: str) -> bool:
     return True
 
 
-# 上游 tool 文件用 `from tradingagents.dataflows.interface import route_to_vendor`,
+# 上游 0.4.x: tool 文件用 `from tradingagents.dataflows.interface import route_to_vendor`,
 # 这是 import-time binding,每个模块持有 **原函数引用**。
 # 只 patch 源头模块属性不够 —— 必须把每个 import site 的 module-level
 # 名字都替换掉,所有调用才会走我们的拦截。
@@ -168,6 +168,34 @@ _ROUTE_TO_VENDOR_IMPORT_SITES = (
     "tradingagents.agents.utils.news_data_tools",
     "tradingagents.agents.utils.core_stock_tools",
     "tradingagents.agents.utils.technical_indicators_tools",
+)
+
+# 上游 0.5.x: route_to_vendor / dataflows.interface 已删除,tool 文件直接
+# `from tradingagents.dataflows.yfinance import get_yfin_data_online` 等。
+# patch 面变为 yfinance/news 模块的函数级 import site:
+#   (源模块, 函数名, [持有该函数引用的模块...])
+# method 分发复用 _serve_from_panwatch(按函数名关键词命中相同分支)。
+_DATAFUNC_PATCH_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("tradingagents.dataflows.yfinance", "get_yfin_data_online",
+     ("tradingagents.agents.utils.core_stock_tools",)),
+    ("tradingagents.dataflows.yfinance", "get_fundamentals",
+     ("tradingagents.agents.utils.fundamental_data_tools",)),
+    ("tradingagents.dataflows.yfinance", "get_balance_sheet",
+     ("tradingagents.agents.utils.fundamental_data_tools",)),
+    ("tradingagents.dataflows.yfinance", "get_cashflow",
+     ("tradingagents.agents.utils.fundamental_data_tools",)),
+    ("tradingagents.dataflows.yfinance", "get_income_statement",
+     ("tradingagents.agents.utils.fundamental_data_tools",)),
+    ("tradingagents.dataflows.yfinance", "get_insider_transactions",
+     ("tradingagents.agents.utils.news_data_tools",)),
+    ("tradingagents.dataflows.yfinance", "get_stock_stats_indicators_batch",
+     ("tradingagents.agents.utils.technical_indicators_tools",)),
+    ("tradingagents.dataflows.yfinance", "get_stock_stats_indicators_window",
+     ("tradingagents.agents.utils.technical_indicators_tools",)),
+    ("tradingagents.dataflows.news", "fetch_news",
+     ("tradingagents.agents.utils.news_data_tools",)),
+    ("tradingagents.dataflows.news", "get_global_news_yfinance",
+     ("tradingagents.agents.utils.news_data_tools",)),
 )
 
 
@@ -179,6 +207,55 @@ _patch_lock = threading.Lock()
 _patch_refcount = 0
 _patch_saved_sites: list[tuple[Any, str, Any]] = []  # (module, attr_name, original_value)
 _real_route_to_vendor = None  # 真 route_to_vendor(走上游 vendor 时用)
+
+# 0.5.x 数据函数级 patch 的真函数表(永久安装,无需卸载:非 PanWatch 标的透传)
+_DATAFUNC_REALS: dict[str, Any] = {}
+_DATAFUNC_PATCHED = False
+
+
+def _ensure_datafunc_patched() -> None:
+    """0.5.x: 把 dataflows.yfinance / dataflows.news 的数据函数替换为 _patched_data_function。
+
+    进程级一次安装、永不卸载:patch 内部对非 PanWatch 标的直接调真函数透传,
+    行为等价未 patch。数据隔离靠 ContextVar(_PANWATCH_DATA),并发安全。
+    """
+    global _DATAFUNC_PATCHED
+    if _DATAFUNC_PATCHED:
+        return
+    import importlib
+
+    with _patch_lock:
+        if _DATAFUNC_PATCHED:
+            return
+        installed = 0
+        for src_module_path, func_name, holder_paths in _DATAFUNC_PATCH_SPECS:
+            try:
+                src_mod = importlib.import_module(src_module_path)
+            except ImportError:
+                continue
+            real = getattr(src_mod, func_name, None)
+            if real is None or func_name in _DATAFUNC_REALS:
+                continue
+            _DATAFUNC_REALS[func_name] = real
+            # 闭包捕获函数名
+            def _make_patched(name: str):
+                def _wrapped(*args, **kwargs):
+                    return _patched_data_function(name, *args, **kwargs)
+                _wrapped.__name__ = name
+                return _wrapped
+            patched = _make_patched(func_name)
+            setattr(src_mod, func_name, patched)
+            installed += 1
+            # 替换每个 import site 持有的引用(from X import f 是 import-time binding)
+            for hp in holder_paths:
+                try:
+                    holder = importlib.import_module(hp)
+                except ImportError:
+                    continue
+                if getattr(holder, func_name, None) is real:
+                    setattr(holder, func_name, patched)
+        _DATAFUNC_PATCHED = True
+        logger.info(f"[TA toolkit] 0.5.x dataflows 函数级 patch 已安装 ({installed} 个函数)")
 
 
 def _patched_route_to_vendor(method_name: str, *args, **kwargs):
@@ -326,70 +403,154 @@ def _patched_route_to_vendor(method_name: str, *args, **kwargs):
     return upstream_result
 
 
+def _patched_data_function(func_name: str, *args, **kwargs):
+    """0.5.x 数据函数级 patch:与 _patched_route_to_vendor 同策略。
+
+    上游签名(0.5.1,全部首参 ticker,curr_date 可第二参):
+      get_yfin_data_online(symbol, start_date, end_date)
+      get_fundamentals(ticker, curr_date=None)
+      get_balance_sheet(ticker, freq='quarterly', curr_date=None)
+      get_cashflow / get_income_statement / get_insider_transactions 同形
+      get_stock_stats_indicators_batch(symbol, indicators, curr_date, look_back_days=30)
+      get_stock_stats_indicators_window(symbol, indicator, curr_date, look_back_days)
+      fetch_news(ticker, start_date, end_date)
+      get_global_news_yfinance(curr_date, look_back_days=7, limit=10)  # 无 ticker
+    """
+    symbol = ""
+    if args and isinstance(args[0], str):
+        first = args[0]
+        # 排除日期串(2026-01-01)与 lookback 场景(get_global_news 首参是日期)
+        if not (len(first) >= 8 and first[4] in "-/"):
+            symbol = first
+    if not symbol:
+        symbol = kwargs.get("symbol") or kwargs.get("ticker") or ""
+    if not symbol:
+        cached_stock = _cache().get("stock")
+        cached_symbol = getattr(cached_stock, "symbol", "") if cached_stock else ""
+        if is_panwatch_routable(cached_symbol):
+            symbol = cached_symbol
+
+    if (is_a_share(symbol) or is_crypto(symbol)) and _cache():
+        try:
+            result = _serve_from_panwatch(func_name, symbol, kwargs, args=args)
+            _emit_toolkit_log(
+                "info", "HIT", func_name, symbol,
+                chars=len(result),
+                snippet=str(result)[:4000],
+                source="panwatch",
+                extra_args=_args_summary(args),
+            )
+            return result
+        except NotImplementedError:
+            _emit_toolkit_log(
+                "info", "MISS", func_name, symbol,
+                reason="PanWatch 未实现该 method,放行到上游",
+            )
+        except Exception as e:
+            _emit_toolkit_log("warning", "ERROR", func_name, symbol, error=str(e)[:200])
+            return f"[PanWatch error: {e}]"
+
+    if is_hk_share(symbol):
+        real = _DATAFUNC_REALS.get(func_name)
+        yf_symbol = hk_symbol_to_yfinance(symbol)
+        new_args = list(args)
+        for i, a in enumerate(new_args):
+            if isinstance(a, str) and a == symbol:
+                new_args[i] = yf_symbol
+                break
+        try:
+            upstream_result = real(*new_args, **kwargs) if real else ""
+        except Exception as e:
+            upstream_result = ""
+            logger.warning(f"[TA toolkit] HK upstream {func_name}({yf_symbol}) 失败: {e}")
+        upstream_str = str(upstream_result) if upstream_result is not None else ""
+
+        if _yfinance_response_has_data(upstream_str):
+            _emit_toolkit_log(
+                "info", "PASSTHROUGH", func_name, symbol,
+                chars=len(upstream_str),
+                snippet=upstream_str[:4000],
+                source=f"upstream HK(→{yf_symbol})",
+                extra_args=_args_summary(args),
+            )
+            return upstream_result
+        if _cache():
+            try:
+                return _serve_from_panwatch(func_name, symbol, kwargs, args=args)
+            except (NotImplementedError, Exception):
+                return f"{_stock_meta_header(symbol)}\n\n[No data available for {symbol}]"
+
+    real = _DATAFUNC_REALS.get(func_name)
+    upstream_result = real(*args, **kwargs) if real else ""
+    _emit_toolkit_log(
+        "info", "UPSTREAM", func_name, symbol or "(none)",
+        chars=len(str(upstream_result or "")),
+        snippet=str(upstream_result or "")[:4000],
+        source="upstream",
+        extra_args=_args_summary(args),
+    )
+    return upstream_result
+
+
 @contextmanager
 def patch_route_to_vendor():
-    """Monkeypatch tradingagents.dataflows.interface.route_to_vendor + 所有 import sites。
+    """Monkeypatch TradingAgents 数据入口(0.4.x: route_to_vendor; 0.5.x: dataflows 函数级)。
 
-    当请求 A 股代码时,从 _PANWATCH_DATA(当前 context)返回 PanWatch 已拉的数据。
-    非 A 股放行到原函数。
+    当请求 A 股/加密代码时,从 _PANWATCH_DATA(当前 context)返回 PanWatch 已拉的数据。
+    非以上标的放行到原函数。
 
     引用计数 + 锁:并发的多个深度分析共享同一次安装,第一个进入者装、最后一个
-    退出才卸载,_real_route_to_vendor 永远保存真函数 —— 消除嵌套 patch 链错乱。
+    退出才卸载,_real 永远保存真函数 —— 消除嵌套 patch 链错乱。
 
     如果 tradingagents 库未安装,本 context manager 是 no-op,不抛异常。
     """
     global _patch_refcount, _real_route_to_vendor
 
-    try:
-        from tradingagents.dataflows import interface as ta_interface
-    except ImportError:
-        logger.warning("[TA toolkit] tradingagents 未安装,跳过 monkeypatch")
-        yield
-        return
-
-    if not hasattr(ta_interface, "route_to_vendor"):
-        logger.warning(
-            "[TA toolkit] route_to_vendor 不存在 (上游 API 可能变更),"
-            "走默认 vendor 路径"
-        )
-        yield
-        return
-
-    # 同时接管 load_ohlcv:新上游 get_verified_market_snapshot 绕过 route_to_vendor。
-    _ensure_load_ohlcv_patched()
-    _ensure_market_snapshot_patched()
-
     import importlib
-    with _patch_lock:
-        if _patch_refcount == 0:
-            # 第一个进入者:保存真函数并装到源头 + 所有 import sites
-            # (`from ... import route_to_vendor` 是 import-time binding,只 patch
-            # 源头不够 — 工具模块持有的原引用不变)
-            _real_route_to_vendor = ta_interface.route_to_vendor
-            _patch_saved_sites.clear()
-            ta_interface.route_to_vendor = _patched_route_to_vendor
-            _patch_saved_sites.append((ta_interface, "route_to_vendor", _real_route_to_vendor))
-            for module_path in _ROUTE_TO_VENDOR_IMPORT_SITES:
-                try:
-                    mod = importlib.import_module(module_path)
-                except ImportError:
-                    continue
-                if hasattr(mod, "route_to_vendor"):
-                    _patch_saved_sites.append((mod, "route_to_vendor", mod.route_to_vendor))
-                    mod.route_to_vendor = _patched_route_to_vendor
-                    logger.debug(f"[TA toolkit] patched route_to_vendor in {module_path}")
-        _patch_refcount += 1
 
+    # 0.4.x 路径:dataflows.interface.route_to_vendor
+    ta_interface = None
     try:
-        yield
-    finally:
+        from tradingagents.dataflows import interface as ta_interface  # noqa: F401
+    except ImportError:
+        pass
+
+    if ta_interface is not None and hasattr(ta_interface, "route_to_vendor"):
+        _ensure_load_ohlcv_patched()
+        _ensure_market_snapshot_patched()
         with _patch_lock:
-            _patch_refcount -= 1
-            if _patch_refcount <= 0:
-                _patch_refcount = 0
-                for mod, attr, orig in _patch_saved_sites:
-                    setattr(mod, attr, orig)
+            if _patch_refcount == 0:
+                _real_route_to_vendor = ta_interface.route_to_vendor
                 _patch_saved_sites.clear()
+                ta_interface.route_to_vendor = _patched_route_to_vendor
+                _patch_saved_sites.append(
+                    (ta_interface, "route_to_vendor", _real_route_to_vendor)
+                )
+                for module_path in _ROUTE_TO_VENDOR_IMPORT_SITES:
+                    try:
+                        mod = importlib.import_module(module_path)
+                    except ImportError:
+                        continue
+                    if hasattr(mod, "route_to_vendor"):
+                        _patch_saved_sites.append((mod, "route_to_vendor", mod.route_to_vendor))
+                        mod.route_to_vendor = _patched_route_to_vendor
+                        logger.debug(f"[TA toolkit] patched route_to_vendor in {module_path}")
+            _patch_refcount += 1
+        try:
+            yield
+        finally:
+            with _patch_lock:
+                _patch_refcount -= 1
+                if _patch_refcount <= 0:
+                    _patch_refcount = 0
+                    for mod, attr, orig in _patch_saved_sites:
+                        setattr(mod, attr, orig)
+                    _patch_saved_sites.clear()
+        return
+
+    # 0.5.x 路径:dataflows.yfinance / dataflows.news 函数级 patch(进程级,永久安装)
+    _ensure_datafunc_patched()
+    yield
 
 
 # ---------------------------------------------------------------------------

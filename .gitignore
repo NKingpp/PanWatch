@@ -37,3 +37,6 @@ docs/superpowers/
 
 # 一键启动/停止脚本的运行时日志与 PID,不入库
 .logs/
+
+# TradingAgents 运行时产物(对话/状态日志),不入库
+results/
