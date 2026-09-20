@@ -636,8 +636,8 @@ def get_tradingagents_budget(db: Session = Depends(get_db)):
 def get_run_progress(trace_id: str, db: Session = Depends(get_db)):
     """读取一次 agent 运行的进度。
 
-    适用 TradingAgents 等长耗时(3-5 分钟)的 agent。从 log_entries 表里
-    查 event=ta_progress + 同 trace_id 的日志,聚合成阶段进度。
+    适用 TradingAgents 等长耗时(3-5 分钟)的 agent。聚合逻辑在
+    tradingagents/progress.build_progress_snapshot(okx_agent 等模块共用)。
 
     返回:
     {
@@ -648,101 +648,18 @@ def get_run_progress(trace_id: str, db: Session = Depends(get_db)):
         "elapsed_sec": float,
         "total_cost_usd": float,
         "stages": [{"name": ..., "status": "pending"|"running"|"done"}, ...],
+        "events": [...原始事件流,含各角色思考文本...],
         "run": {  # 最终 AgentRun(已完成时)
             "status": ..., "result": ..., "error": ..., "duration_ms": ...
         }
     }
     """
-    from src.modules.automation.tradingagents.progress import aggregate_progress
+    from src.modules.automation.tradingagents.progress import build_progress_snapshot
 
     if not trace_id or len(trace_id) > 64:
         raise HTTPException(400, "无效的 trace_id")
 
-    logs = (
-        db.query(LogEntry)
-        .filter(
-            LogEntry.trace_id == trace_id,
-            LogEntry.event.in_(["ta_progress", "ta_toolkit"]),
-        )
-        .order_by(LogEntry.id.asc())
-        .limit(500)
-        .all()
-    )
-    log_dicts = [
-        {
-            "timestamp": _format_datetime(le.timestamp),
-            "level": le.level,
-            "message": le.message,
-            "event": le.event,
-            "tags": le.tags or {},
-        }
-        for le in logs
-    ]
-
-    progress_logs = [d for d in log_dicts if d.get("event") == "ta_progress"]
-    progress = aggregate_progress(progress_logs)
-
-    # 工具调用诊断:汇总 5 类 action 次数 + 最近 50 条详情
-    # 港股转格式/兜底等场景归到对应基础类(HIT/PASSTHROUGH/ERROR),
-    # source 字段区分具体来源(yfinance/panwatch HK fallback/...)
-    toolkit_logs = [d for d in log_dicts if d.get("event") == "ta_toolkit"]
-    toolkit_summary = {"hit": 0, "miss": 0, "passthrough": 0, "fallthrough": 0, "error": 0}
-    toolkit_recent = []
-    for d in toolkit_logs:
-        tags = d.get("tags") or {}
-        action = (tags.get("action") or "").lower()
-        if action in toolkit_summary:
-            toolkit_summary[action] += 1
-        toolkit_recent.append({
-            "timestamp": d.get("timestamp"),
-            "action": tags.get("action"),
-            "method": tags.get("method"),
-            "symbol": tags.get("symbol"),
-            "reason": tags.get("reason"),
-            "chars": tags.get("chars"),
-            "snippet": tags.get("snippet"),
-            "source": tags.get("source"),
-        })
-    progress["toolkit_summary"] = toolkit_summary
-    progress["toolkit_recent"] = toolkit_recent[-50:]
-
-    run = (
-        db.query(AgentRun)
-        .filter(AgentRun.trace_id == trace_id)
-        .order_by(AgentRun.id.desc())
-        .first()
-    )
-
-    if run:
-        status = run.status
-        progress["run"] = {
-            "agent_name": run.agent_name,
-            "status": run.status,
-            "result": (run.result or "")[:1000],
-            "error": (run.error or "")[:500],
-            "duration_ms": run.duration_ms,
-            "model_label": run.model_label,
-            "notify_sent": run.notify_sent,
-        }
-    elif log_dicts:
-        # 检测"僵尸 running":server 重启 / 工作线程死掉时,日志还在但任务已不在跑。
-        # 最后一条进度日志距今 > STALE_THRESHOLD 视为中断,前端可据此 reset 回 idle。
-        STALE_THRESHOLD_SEC = 300  # 5 分钟
-        last_log = logs[-1]  # logs 已 order_by id.asc(),末尾是最新
-        last_ts = last_log.timestamp
-        if last_ts is not None:
-            if last_ts.tzinfo is None:
-                last_ts = last_ts.replace(tzinfo=timezone.utc)
-            idle_sec = (datetime.now(timezone.utc) - last_ts).total_seconds()
-            status = "stale" if idle_sec > STALE_THRESHOLD_SEC else "running"
-        else:
-            status = "running"
-    else:
-        status = "not_found"
-
-    progress["trace_id"] = trace_id
-    progress["status"] = status
-    return progress
+    return build_progress_snapshot(db, trace_id)
 
 
 # 进度 SSE 轮询/推送节奏与终态判定

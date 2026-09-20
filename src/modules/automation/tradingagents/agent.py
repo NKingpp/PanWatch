@@ -489,6 +489,16 @@ class TradingAgentsAgent(BaseAgent):
                 callbacks=[progress_handler] if progress_handler else None,
             )
 
+            # 开 token 级流式(触发 on_llm_new_token → 前端聊天流)。
+            # pydantic 字段赋值;部分 provider 不支持 stream 时 langchain 会
+            # 走 on_llm_error 回调,流程仍可继续(文本兜底由 on_llm_end 全量输出)。
+            if progress_handler is not None:
+                for _llm in (graph.quick_thinking_llm, graph.deep_thinking_llm):
+                    try:
+                        _llm.streaming = True
+                    except Exception as e:
+                        logger.debug(f"[TA] 开启 LLM streaming 失败(忽略): {e}")
+
             # 注入 LangGraph 节点级 callbacks(propagator.get_graph_args 默认 callbacks=None,
             # 不会触发 on_chain_start/end → 进度条永远卡 pending)
             if progress_handler is not None:

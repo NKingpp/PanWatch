@@ -2046,6 +2046,85 @@ CREATE TABLE ta_trade_strategies (
     )
 
 
+def _m129_okx_algo_trading(conn: Connection) -> None:
+    """OKX 策略委托:提案(人工确认流)+ 算法委托单快照。"""
+    if not _has_table(conn, "okx_algo_proposals"):
+        conn.execute(
+            text(
+                """
+CREATE TABLE okx_algo_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inst_id TEXT NOT NULL,
+    td_mode TEXT NOT NULL DEFAULT 'cash',
+    side TEXT NOT NULL,
+    ord_type TEXT NOT NULL,
+    sz TEXT NOT NULL DEFAULT '',
+    order_px TEXT NOT NULL DEFAULT '',
+    tp_trigger_px TEXT NOT NULL DEFAULT '',
+    tp_ord_px TEXT NOT NULL DEFAULT '-1',
+    sl_trigger_px TEXT NOT NULL DEFAULT '',
+    sl_ord_px TEXT NOT NULL DEFAULT '-1',
+    trigger_px TEXT NOT NULL DEFAULT '',
+    callback_ratio TEXT NOT NULL DEFAULT '',
+    move_trigger_px TEXT NOT NULL DEFAULT '',
+    reduce_only INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending_confirm',
+    algo_id TEXT,
+    s_code TEXT NOT NULL DEFAULT '',
+    s_msg TEXT NOT NULL DEFAULT '',
+    risk_check TEXT,
+    snapshot_before TEXT,
+    snapshot_after TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+            )
+        )
+    _create_index_if_missing(
+        conn,
+        "ix_okx_algo_proposals_status",
+        "CREATE INDEX ix_okx_algo_proposals_status ON okx_algo_proposals(status)",
+    )
+    if not _has_table(conn, "okx_algo_orders"):
+        conn.execute(
+            text(
+                """
+CREATE TABLE okx_algo_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inst_id TEXT NOT NULL,
+    td_mode TEXT NOT NULL DEFAULT 'cash',
+    side TEXT NOT NULL,
+    ord_type TEXT NOT NULL,
+    sz TEXT NOT NULL DEFAULT '',
+    trigger_px TEXT NOT NULL DEFAULT '',
+    order_px TEXT NOT NULL DEFAULT '',
+    tp_trigger_px TEXT NOT NULL DEFAULT '',
+    tp_ord_px TEXT NOT NULL DEFAULT '-1',
+    sl_trigger_px TEXT NOT NULL DEFAULT '',
+    sl_ord_px TEXT NOT NULL DEFAULT '-1',
+    callback_ratio TEXT NOT NULL DEFAULT '',
+    move_trigger_px TEXT NOT NULL DEFAULT '',
+    reduce_only INTEGER NOT NULL DEFAULT 0,
+    cl_ord_id TEXT NOT NULL DEFAULT '',
+    algo_id TEXT,
+    status TEXT NOT NULL DEFAULT 'submitting',
+    s_code TEXT NOT NULL DEFAULT '',
+    s_msg TEXT NOT NULL DEFAULT '',
+    okx_response TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+            )
+        )
+    _create_index_if_missing(
+        conn,
+        "ix_okx_algo_orders_algo_id",
+        "CREATE INDEX ix_okx_algo_orders_algo_id ON okx_algo_orders(algo_id)",
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -2075,6 +2154,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(126, "assistant_task_events", _m126_assistant_task_events),
     Migration(127, "okx_agent_tables", _m127_okx_agent_tables),
     Migration(128, "ta_trade_strategies", _m128_ta_trade_strategies),
+    Migration(129, "okx_algo_trading", _m129_okx_algo_trading),
 )
 
 

@@ -34,3 +34,6 @@ docs/superpowers/
 
 # WorkBuddy 本地数据(记忆/工具),不入库
 .workbuddy/
+
+# 一键启动/停止脚本的运行时日志与 PID,不入库
+.logs/

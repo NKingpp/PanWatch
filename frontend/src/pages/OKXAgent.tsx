@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Bot, RefreshCw, Send, X, Wallet, ListOrdered, History as HistoryIcon, AlertTriangle, Sparkles, Check, Ban, Loader2 } from 'lucide-react'
+import { Bot, RefreshCw, Send, X, Wallet, ListOrdered, History as HistoryIcon, AlertTriangle, Sparkles, Check, Ban, Loader2, MessageSquare } from 'lucide-react'
 import {
   getOKXAgentStatus,
   toggleOKXAgent,
@@ -10,16 +10,17 @@ import {
   getOKXAgentPositions,
   getOKXAgentPendingOrders,
   triggerOKXAnalysis,
-  getOKXAnalyzeStatus,
   getOKXStrategies,
   approveOKXStrategy,
   rejectOKXStrategy,
+  streamOKXAnalyzeProgress,
   type OKXAgentStatus,
   type OKXAgentHistoryItem,
   type OKXAgentBalanceItem,
   type OKXAgentPositionItem,
   type OKXPendingOrderItem,
   type TAStrategy,
+  type TAProgressEvent,
 } from '@panwatch/api'
 import { Input } from '@panwatch/base-ui/components/ui/input'
 import { Label } from '@panwatch/base-ui/components/ui/label'
@@ -28,6 +29,7 @@ import { Switch } from '@panwatch/base-ui/components/ui/switch'
 import { Badge } from '@panwatch/base-ui/components/ui/badge'
 import { useToast } from '@panwatch/base-ui/components/ui/toast'
 import { InstIdSelect } from '../components/InstIdSelect'
+import { AlgoTradingCard } from '../components/AlgoTradingCard'
 
 const statusBadge = (s: string) => {
   const ok = ['live', 'filled']
@@ -40,6 +42,70 @@ const statusBadge = (s: string) => {
 const fmtEq = (v: string | undefined) => {
   const n = parseFloat(v || '0')
   return isNaN(n) ? '—' : n.toLocaleString(undefined, { maximumFractionDigits: 4 })
+}
+
+// ---- AI 策略聊天流:事件 → 聊天消息模型 ----
+
+interface ChatMsg {
+  key: string
+  kind: 'role_start' | 'role_text' | 'role_end' | 'system' | 'strategy'
+  stage: string
+  label: string
+  text: string
+  done: boolean
+}
+
+const STAGE_LABEL: Record<string, string> = {
+  market_analyst: '市场分析师',
+  social_analyst: '情绪分析师',
+  news_analyst: '新闻分析师',
+  fundamentals_analyst: '基本面分析师',
+  bull_researcher: '多头研究员',
+  bear_researcher: '空头研究员',
+  research_manager: '研究主管',
+  trader: '交易员',
+  aggressive_analyst: '激进派风控',
+  conservative_analyst: '保守派风控',
+  neutral_analyst: '中立派风控',
+  final_decision: '投资组合经理',
+}
+
+const stageLabel = (e: TAProgressEvent) =>
+  e.stage_label || STAGE_LABEL[e.stage] || (e.stage === 'llm_call' ? '思考中' : e.stage || '系统')
+
+/** 把 SSE 事件流(去重后)折叠成聊天消息列表。 */
+const buildChat = (events: TAProgressEvent[]): ChatMsg[] => {
+  const msgs: ChatMsg[] = []
+  const seen = new Set<number>()
+  // 每个角色当前文本块索引(同角色多轮 LLM 调用追加同一条消息)
+  const stageText = new Map<string, ChatMsg>()
+  for (const e of events) {
+    if (seen.has(e.id)) continue
+    seen.add(e.id)
+    const label = stageLabel(e)
+    if (e.action === 'stage_start') {
+      const m: ChatMsg = { key: `s-${e.id}`, kind: 'role_start', stage: e.stage, label, text: '', done: false }
+      msgs.push(m)
+    } else if (e.action === 'llm_token' || e.action === 'llm_text') {
+      // 同一角色:文本追加到已有 text 消息;llm_text 是全量,token 是增量 — 仅取 llm_text
+      if (e.action === 'llm_token') continue
+      let m = stageText.get(e.stage)
+      if (!m) {
+        m = { key: `t-${e.stage}-${e.id}`, kind: 'role_text', stage: e.stage, label, text: '', done: true }
+        stageText.set(e.stage, m)
+        msgs.push(m)
+      }
+      m.text += (m.text ? '\n\n' : '') + e.text
+    } else if (e.action === 'stage_end') {
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i]
+        if (m.stage === e.stage && m.kind === 'role_start' && !m.done) { m.done = true; break }
+      }
+    } else if (e.action === 'llm_error' || e.action === 'chain_error') {
+      msgs.push({ key: `e-${e.id}`, kind: 'system', stage: '', label: '错误', text: e.text, done: true })
+    }
+  }
+  return msgs
 }
 
 export default function OKXAgentPage() {
@@ -64,13 +130,15 @@ export default function OKXAgentPage() {
   const [cancelId, setCancelId] = useState('')
   const [cancelling, setCancelling] = useState(false)
 
-  // AI 策略
+  // AI 策略(聊天流)
   const [aiInstId, setAiInstId] = useState('BTC-USDT')
   const [analyzing, setAnalyzing] = useState(false)
+  const [chatMsgs, setChatMsgs] = useState<ChatMsg[]>([])
+  const [snapStatus, setSnapStatus] = useState('')
   const [strategies, setStrategies] = useState<TAStrategy[]>([])
-  const [approveSz, setApproveSz] = useState<Record<number, string>>({})
   const [approving, setApproving] = useState<number | null>(null)
-  const pollRef = useRef<number | null>(null)
+  const sseAbortRef = useRef<AbortController | null>(null)
+  const chatEndRef = useRef<HTMLDivElement | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -101,7 +169,7 @@ export default function OKXAgentPage() {
 
   useEffect(() => { load() }, [load])
 
-  // AI 策略:挂载拉一次 + 分析中 10s 轮询
+  // AI 策略:挂载拉一次;分析中由 SSE 驱动
   const loadStrategies = useCallback(async () => {
     try {
       const list = await getOKXStrategies('', '', 30)
@@ -111,47 +179,50 @@ export default function OKXAgentPage() {
 
   useEffect(() => {
     loadStrategies()
-    getOKXAnalyzeStatus('BTC-USDT').then(s => setAnalyzing(s.analyzing)).catch(() => {})
-    return () => { if (pollRef.current) window.clearInterval(pollRef.current) }
+    return () => { sseAbortRef.current?.abort() }
   }, [loadStrategies])
 
   useEffect(() => {
-    if (!analyzing) {
-      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null }
-      return
-    }
-    pollRef.current = window.setInterval(async () => {
-      try {
-        const [s] = await Promise.all([
-          getOKXAnalyzeStatus(aiInstId),
-          loadStrategies(),
-        ])
-        if (!s.analyzing) {
-          setAnalyzing(false)
-          toast('深度分析完成,请查看策略', 'success')
-        }
-      } catch { /* 忽略轮询错误 */ }
-    }, 10_000)
-    return () => { if (pollRef.current) window.clearInterval(pollRef.current); pollRef.current = null }
-  }, [analyzing, aiInstId, loadStrategies, toast])
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [chatMsgs, analyzing])
 
   const handleAnalyze = async () => {
     if (!aiInstId || !aiInstId.includes('-')) { toast('请填写交易对(如 BTC-USDT)', 'error'); return }
     try {
-      await triggerOKXAnalysis(aiInstId)
+      const r = await triggerOKXAnalysis(aiInstId)
+      setChatMsgs([])
+      setSnapStatus('')
       setAnalyzing(true)
-      toast('深度分析已提交,预计 3-5 分钟', 'success')
+      toast('深度分析已启动,实时输出思考过程', 'success')
+      // SSE 订阅实时流
+      const ac = new AbortController()
+      sseAbortRef.current?.abort()
+      sseAbortRef.current = ac
+      streamOKXAnalyzeProgress(
+        r.trace_id,
+        (snap) => {
+          setChatMsgs(buildChat(snap.events ?? []))
+          setSnapStatus(String(snap.status ?? ''))
+        },
+        { signal: ac.signal },
+      ).catch((e: unknown) => {
+        if ((e as Error)?.name === 'AbortError') return
+        toast(e instanceof Error ? e.message : '实时流中断', 'error')
+      }).finally(() => {
+        setAnalyzing(false)
+        // 终态与策略落库有毫秒级间隔,补拉一次
+        setTimeout(() => loadStrategies(), 1500)
+        loadStrategies()
+      })
     } catch (e) {
       toast(e instanceof Error ? e.message : '提交失败', 'error')
     }
   }
 
   const handleApprove = async (s: TAStrategy) => {
-    const sz = (approveSz[s.id] || '').trim()
-    if (!sz || parseFloat(sz) <= 0) { toast('请填写数量', 'error'); return }
     setApproving(s.id)
     try {
-      const r = await approveOKXStrategy(s.id, { sz, ord_type: s.ord_type, td_mode: s.td_mode })
+      const r = await approveOKXStrategy(s.id, { ord_type: s.ord_type, td_mode: s.td_mode })
       toast(`策略已执行 ordId=${r.ord_id || '-'}`, 'success')
       loadStrategies()
       load()
@@ -264,76 +335,129 @@ export default function OKXAgentPage() {
         </div>
       )}
 
-      {/* AI 策略(TradingAgents 多 Agent 决策 → 人工确认执行) */}
+      {/* AI 策略:聊天流 + 人工确认 */}
       <div className="card p-4">
         <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
           <div className="flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-violet-600" />
             <span className="text-[13px] font-semibold text-foreground">AI 策略 · TradingAgents 多 Agent 决策</span>
+            {analyzing && (
+              <Badge variant="secondary" className="text-[10px] gap-1">
+                <Loader2 className="w-3 h-3 animate-spin" /> {snapStatus || 'running'}
+              </Badge>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <InstIdSelect value={aiInstId} onChange={setAiInstId} disabled={analyzing} className="w-36" />
             <Button size="sm" onClick={handleAnalyze} disabled={analyzing}>
-              {analyzing ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> 分析中…</> : '深度分析'}
+              {analyzing ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> 分析中…</> : '开始分析'}
             </Button>
           </div>
         </div>
-        <div className="text-[11px] text-muted-foreground mb-3">
-          选择交易对 → 9-Agent 框架深度分析(分析师 → 辩论 → 风控 → PM,3-5 分钟)→ 生成买卖策略 → 你确认后执行。hold/待复核 不生成策略。
-        </div>
-        {strategies.length === 0 ? (
-          <div className="text-[12px] text-muted-foreground py-4 text-center">暂无策略。选择交易对发起深度分析。</div>
-        ) : (
-          <div className="space-y-2">
-            {strategies.map(s => {
-              const pending = s.status === 'pending'
-              return (
-                <div key={s.id} className="rounded-lg border border-border p-3 bg-accent/20">
-                  <div className="flex items-center justify-between gap-2 flex-wrap">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-mono text-[13px] font-bold text-foreground">{s.inst_id}</span>
-                      <Badge variant={s.action === 'buy' ? 'destructive' : 'secondary'} className="text-[10px]">
-                        {s.action === 'buy' ? '买入' : s.action === 'sell' ? '卖出' : s.action_label}
-                      </Badge>
-                      <span className="text-[11px] text-muted-foreground">置信度 {Number(s.confidence ?? 0).toFixed(1)}/10</span>
-                      <Badge variant="outline" className="text-[10px]">{s.status}</Badge>
-                      <span className="text-[10px] text-muted-foreground">{s.created_at?.slice(5, 16)}</span>
-                    </div>
-                    {pending && (
-                      <div className="flex items-center gap-1.5">
-                        <Input
-                          value={approveSz[s.id] ?? ''}
-                          onChange={e => setApproveSz(prev => ({ ...prev, [s.id]: e.target.value }))}
-                          placeholder="数量"
-                          className="w-24 h-8 font-mono text-[12px]"
-                        />
-                        <Button size="sm" onClick={() => handleApprove(s)} disabled={approving === s.id || !enabled || !credsOk}>
-                          {approving === s.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
-                          执行
-                        </Button>
-                        <Button size="sm" variant="outline" onClick={() => handleReject(s)}>
-                          <Ban className="w-3.5 h-3.5" />
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-                  {s.reason && (
-                    <div className="mt-2 text-[11px] text-muted-foreground leading-relaxed line-clamp-3" title={s.reason}>
-                      {s.reason}
-                    </div>
-                  )}
-                  {s.error_msg && (
-                    <div className="mt-1.5 text-[11px] text-red-600">{s.error_msg}</div>
-                  )}
-                  {s.ord_id && (
-                    <div className="mt-1.5 font-mono text-[10px] text-muted-foreground">ordId: {s.ord_id}</div>
-                  )}
+
+        {/* 聊天流 */}
+        <div className="rounded-lg border border-border bg-accent/10 p-3 h-80 overflow-y-auto scrollbar space-y-3">
+          {chatMsgs.length === 0 && !analyzing && (
+            <div className="h-full flex flex-col items-center justify-center gap-2 text-muted-foreground">
+              <MessageSquare className="w-6 h-6 opacity-40" />
+              <div className="text-[12px]">选择交易对发起深度分析,9-Agent 思考过程将实时展示;仓位按账户剩余资金自动决策。</div>
+            </div>
+          )}
+          {chatMsgs.map(m => (
+            <div key={m.key} className={m.kind === 'system' ? 'text-[11px] text-red-600 px-2' : ''}>
+              {m.kind === 'role_start' && (
+                <div className="flex items-center gap-2">
+                  <span className={`w-1.5 h-1.5 rounded-full ${m.done ? 'bg-emerald-500' : 'bg-violet-500 animate-pulse'}`} />
+                  <span className="text-[12px] font-semibold text-foreground">{m.label}</span>
+                  <span className="text-[10px] text-muted-foreground">{m.done ? '完成' : '思考中…'}</span>
                 </div>
-              )
-            })}
+              )}
+              {m.kind === 'role_text' && m.text && (
+                <div className="ml-3.5 mt-1 pl-2.5 border-l-2 border-violet-500/30 text-[11px] text-muted-foreground leading-relaxed whitespace-pre-wrap break-words">
+                  {m.text.length > 1500 ? m.text.slice(0, 1500) + '…' : m.text}
+                </div>
+              )}
+              {m.kind === 'system' && <div>{m.text}</div>}
+            </div>
+          ))}
+          {analyzing && chatMsgs.length === 0 && (
+            <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" /> 已连接数据流,等待第一个角色入场…
+            </div>
+          )}
+          <div ref={chatEndRef} />
+        </div>
+
+        {/* 待确认策略(分析完成后) */}
+        {strategies.filter(s => s.status === 'pending').length > 0 && (
+          <div className="mt-3 space-y-2">
+            <div className="text-[11px] font-medium text-muted-foreground">决策完成 · 待人工确认</div>
+            {strategies.filter(s => s.status === 'pending').map(s => (
+              <div key={s.id} className="rounded-lg border border-violet-500/40 p-3 bg-violet-500/5">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-mono text-[13px] font-bold text-foreground">{s.inst_id}</span>
+                    <Badge variant={s.action === 'buy' ? 'destructive' : 'secondary'} className="text-[10px]">
+                      {s.action === 'buy' ? '买入' : '卖出'}
+                    </Badge>
+                    <span className="text-[11px] text-muted-foreground">置信度 {Number(s.confidence ?? 0).toFixed(1)}/10</span>
+                    {s.sz && (
+                      <Badge variant="outline" className="text-[10px] font-mono">
+                        数量 {s.sz}(按剩余资金自动决策)
+                      </Badge>
+                    )}
+                    <span className="text-[10px] text-muted-foreground">{s.created_at?.slice(5, 16)}</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <Button size="sm" onClick={() => handleApprove(s)} disabled={approving === s.id || !enabled || !credsOk}>
+                      {approving === s.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                      确认执行
+                    </Button>
+                    <Button size="sm" variant="outline" onClick={() => handleReject(s)}>
+                      <Ban className="w-3.5 h-3.5" />
+                    </Button>
+                  </div>
+                </div>
+                {s.reason && (
+                  <div className="mt-2 text-[11px] text-muted-foreground leading-relaxed line-clamp-3" title={s.reason}>
+                    {s.reason}
+                  </div>
+                )}
+              </div>
+            ))}
           </div>
         )}
+
+        {/* 历史策略(折叠) */}
+        {strategies.filter(s => s.status !== 'pending').length > 0 && (
+          <details className="mt-3">
+            <summary className="text-[11px] text-muted-foreground cursor-pointer select-none">
+              历史策略({strategies.filter(s => s.status !== 'pending').length})
+            </summary>
+            <div className="mt-2 space-y-1.5">
+              {strategies.filter(s => s.status !== 'pending').map(s => (
+                <div key={s.id} className="flex items-center justify-between gap-2 px-2 py-1.5 rounded bg-accent/40">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="font-mono text-[11px] text-foreground">{s.inst_id}</span>
+                    <span className={`text-[11px] font-medium ${s.action === 'buy' ? 'text-red-600' : 'text-green-600'}`}>
+                      {s.action === 'buy' ? '买入' : '卖出'}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground truncate">{s.created_at?.slice(5, 16)} · {s.sz || '—'}</span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {s.error_msg && <span className="text-[10px] text-red-600 max-w-40 truncate" title={s.error_msg}>{s.error_msg}</span>}
+                    <Badge variant="outline" className="text-[10px]">{s.status}</Badge>
+                    {s.ord_id && <span className="font-mono text-[10px] text-muted-foreground">{s.ord_id}</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </details>
+        )}
       </div>
+
+      {/* 策略委托(Algo Trading):风控 + 人工确认 */}
+      <AlgoTradingCard enabled={enabled} credsOk={credsOk} />
 
       {/* 余额 / 持仓 */}
       {credsOk && (

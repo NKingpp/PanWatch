@@ -128,3 +128,68 @@ class TestAnalysisThreads:
         import time
         time.sleep(0.2)
         assert not ta_strategy.is_analyzing("TEST2-USDT")
+
+
+class TestAutoSizing:
+    """api._auto_size_position 的纯函数部分:仓位比例映射 + lotSz 对齐。"""
+
+    def test_conf_to_pct(self):
+        from src.modules.okx_agent.api import _conf_to_pct
+        assert _conf_to_pct(9.0) == 0.30
+        assert _conf_to_pct(8.0) == 0.30
+        assert _conf_to_pct(6.5) == 0.20
+        assert _conf_to_pct(4.0) == 0.10
+        assert _conf_to_pct(1.0) == 0.05
+
+    def test_align_sz_btc(self):
+        # BTC-USDT: lotSz=0.00000001 但常规 0.00001 步长,minSz=0.00001
+        from src.modules.okx_agent.api import _align_sz
+        assert _align_sz(0.0012345, 0.00001, 0.00001) == "0.00123"
+        assert _align_sz(0.000004, 0.00001, 0.00001) == ""   # 低于 minSz
+        assert _align_sz(0, 0.00001, 0.00001) == ""
+
+    def test_align_sz_eth(self):
+        # ETH-USDT: lotSz=0.001, minSz=0.001
+        from src.modules.okx_agent.api import _align_sz
+        assert _align_sz(0.12345, 0.001, 0.001) == "0.123"
+        assert _align_sz(1.7, 0.1, 0.1) == "1.7"
+
+    def test_align_sz_no_step(self):
+        from src.modules.okx_agent.api import _align_sz
+        assert _align_sz(3.14159, 0, 0) == "3.14159"
+        assert _align_sz(2.0, 0, 3.0) == ""   # 无步长但低于 minSz
+
+
+class TestProgressStreamEvents:
+    """PanWatchProgressHandler 的角色思考文本输出(token + 全量)。"""
+
+    def _handler(self):
+        from src.modules.automation.tradingagents.progress import PanWatchProgressHandler
+        return PanWatchProgressHandler("trace-x", "tradingagents")
+
+    def test_llm_end_emits_text(self):
+        from types import SimpleNamespace
+        h = self._handler()
+        h.on_chain_start(None, {}, name="Market Analyst")
+        gen = SimpleNamespace(text="市场情绪偏多,资金流入明显")
+        resp = SimpleNamespace(generations=[[gen]], llm_output={})
+        h.on_llm_end(resp)
+        assert h._current_stage == "market_analyst"
+
+    def test_llm_new_token_buffers(self):
+        h = self._handler()
+        h.on_llm_new_token("a" * 40)
+        h.on_llm_new_token("b" * 60)   # 超过 80 字符 → 自动 flush
+        assert len(h._stream_buffer) == 0
+        h.on_llm_new_token("c")
+        assert len(h._stream_buffer) == 1
+
+    def test_normalize_stage_subroles(self):
+        from src.modules.automation.tradingagents.progress import _normalize_stage
+        assert _normalize_stage("Bull Researcher") == "bull_researcher"
+        assert _normalize_stage("Bear Researcher") == "bear_researcher"
+        assert _normalize_stage("Sentiment Analyst") == "social_analyst"
+        assert _normalize_stage("Portfolio Manager") == "final_decision"
+        assert _normalize_stage("Aggressive Analyst") == "aggressive_analyst"
+        assert _normalize_stage("Research Manager") == "research_manager"
+        assert _normalize_stage("tools_market") == ""

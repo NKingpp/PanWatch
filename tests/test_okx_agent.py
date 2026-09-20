@@ -55,6 +55,15 @@ def test_credentials_from_env(monkeypatch):
 def test_credentials_missing_returns_none(monkeypatch):
     for k in ("OKX_AGENT_API_KEY", "OKX_AGENT_SECRET_KEY", "OKX_AGENT_PASSPHRASE"):
         monkeypatch.delenv(k, raising=False)
+
+    class _EmptySettings:
+        def __init__(self):
+            self.okx_agent_api_key = ""
+            self.okx_agent_secret_key = ""
+            self.okx_agent_passphrase = ""
+
+    # .env 文件兜底也要排除(模拟无 .env 部署)
+    monkeypatch.setattr("src.platform.runtime.config.Settings", _EmptySettings)
     assert OKXCredentials.from_env() is None
 
 

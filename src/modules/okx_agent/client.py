@@ -32,6 +32,19 @@ _MIN_INTERVAL_S = 0.2
 _last_request_ts = 0.0
 
 
+def simulated_from_env() -> bool:
+    """OKX_AGENT_SIMULATED 是否开启(env → Settings(.env) 兜底)。"""
+    import os
+    v = os.environ.get("OKX_AGENT_SIMULATED", "").strip().lower()
+    if not v:
+        try:
+            from src.platform.runtime.config import Settings
+            v = (Settings().okx_agent_simulated or "").strip().lower()
+        except Exception:
+            v = ""
+    return v in ("1", "true", "yes")
+
+
 class OKXAgentError(Exception):
     """结构化错误:code/msg/data 与 OKX 响应同形,可直接回传策略层。"""
 
@@ -55,11 +68,25 @@ class OKXCredentials:
 
     @classmethod
     def from_env(cls, *, simulated: bool = False, label: str = "default") -> "OKXCredentials | None":
-        """从环境变量读密钥;缺任一项返回 None(不抛错,调用方决定如何提示)。"""
+        """从环境变量读密钥;缺任一项返回 None(不抛错,调用方决定如何提示)。
+
+        读取顺序:os.environ → Settings(.env 文件,懒加载,只在 env 缺失时兜底)。
+        """
         import os
-        key = os.environ.get("OKX_AGENT_API_KEY", "").strip()
-        sec = os.environ.get("OKX_AGENT_SECRET_KEY", "").strip()
-        phrase = os.environ.get("OKX_AGENT_PASSPHRASE", "").strip()
+
+        def _get(env_key: str, settings_field: str) -> str:
+            v = os.environ.get(env_key, "").strip()
+            if v:
+                return v
+            try:
+                from src.platform.runtime.config import Settings
+                return getattr(Settings(), settings_field, "").strip()
+            except Exception:
+                return ""
+
+        key = _get("OKX_AGENT_API_KEY", "okx_agent_api_key")
+        sec = _get("OKX_AGENT_SECRET_KEY", "okx_agent_secret_key")
+        phrase = _get("OKX_AGENT_PASSPHRASE", "okx_agent_passphrase")
         if simulated:
             key = os.environ.get("OKX_AGENT_DEMO_API_KEY", key).strip()
             sec = os.environ.get("OKX_AGENT_DEMO_SECRET_KEY", sec).strip()
